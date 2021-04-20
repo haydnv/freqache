@@ -4,7 +4,7 @@ version = "0.1.0"
 authors = ["haydnv"]
 edition = "2018"
 license = "Apache-2.0"
-description = "A thread-safe LFU cache which supports a custom eviction policy"
+description = "A weighted, thread-safe, futures-aware LFU cache which supports a custom eviction policy"
 repository = "http://github.com/haydnv/freqache"
 readme = "README.md"
 
@@ -12,7 +12,6 @@ categories = ["asynchronous", "caching", "concurrency", "data-structures"]
 keywords = ["lfu", "cache", "custom", "eviction"]
 
 [dependencies]
-async-trait = "0.1"
 futures = "0.3"
 uplock = "0.1"
 

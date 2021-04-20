@@ -1,40 +1,81 @@
+//! A weighted, thread-safe, futures-aware least-frequently-used cache.
+//!
+//! [`LFUCache`] does not provide a default eviction policy, but a callback and traversal method
+//! which allow the developer to implement their own.
+//!
+//! Example:
+//! ```
+//! # use std::time::Duration;
+//! # use futures::executor::block_on;
+//! use freqache::{Entry, LFUCache};
+//!
+//! #[derive(Clone)]
+//! struct Item;
+//!
+//! impl Entry for Item {
+//!     fn weight() -> u64 {
+//!         1
+//!     }
+//! }
+//!
+//! struct Evict;
+//!
+//! let (tx, rx) = std::sync::mpsc::channel();
+//! let mut cache = LFUCache::new(100, || { tx.send(Evict); });
+//! cache.insert("key", Item);
+//!
+//! while rx.recv_timeout(Duration::default()).is_ok() {
+//!     cache.evict(|key, value| {
+//!         // maybe backup the contents of the entry here
+//!         futures::future::ready(Result::<bool, String>::Ok(true))
+//!     });
+//! }
+//! ```
+
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
 
-use async_trait::async_trait;
-use futures::{join, FutureExt};
+use futures::{join, Future, FutureExt};
 use uplock::RwLock;
 
-#[async_trait]
+/// An [`LFUCache`] entry
 pub trait Entry: Clone {
-    fn weight(&self) -> u64;
+    fn weight() -> u64;
 }
 
-struct Item<V> {
+struct Item<K, V> {
+    key: K,
     value: V,
     prev: Option<RwLock<Self>>,
     next: Option<RwLock<Self>>,
 }
 
-pub struct LFUCache<K, V> {
-    cache: HashMap<K, RwLock<Item<V>>>,
-    first: Option<RwLock<Item<V>>>,
-    last: Option<RwLock<Item<V>>>,
+/// A weighted, thread-safe, futures-aware least-frequently-used cache
+pub struct LFUCache<K, V, F> {
+    cache: HashMap<K, RwLock<Item<K, V>>>,
+    first: Option<RwLock<Item<K, V>>>,
+    last: Option<RwLock<Item<K, V>>>,
+    occupied: u64,
     capacity: u64,
+    policy: F,
 }
 
-impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
-    pub fn new(capacity: u64) -> Self {
+impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
+    /// Construct a new `LFUCache`.
+    pub fn new(capacity: u64, policy: F) -> Self {
         Self {
             cache: HashMap::new(),
             first: None,
             last: None,
+            occupied: 0,
             capacity,
+            policy,
         }
     }
 
+    /// Return `true` if the cache contains the given key.
     pub fn contains_key<Q: ?Sized>(&mut self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -43,6 +84,7 @@ impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
         self.cache.contains_key(key)
     }
 
+    /// Clone and return the value of the cache entry with the given key.
     pub async fn get<Q: ?Sized>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
@@ -65,6 +107,7 @@ impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
         }
     }
 
+    /// Add a new entry to the cache.
     pub async fn insert(&mut self, key: K, value: V) -> bool {
         if let Some(item) = self.cache.get(&key) {
             let (last, first) = bump(item).await;
@@ -82,7 +125,13 @@ impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
             let mut last = None;
             mem::swap(&mut self.last, &mut last);
 
+            self.occupied += V::weight();
+            if self.occupied > self.capacity {
+                (self.policy)();
+            }
+
             let item = RwLock::new(Item {
+                key: key.clone(),
                 value,
                 prev: None,
                 next: last,
@@ -98,10 +147,17 @@ impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
         }
     }
 
+    /// Return `true` if the cache is full.
+    pub fn is_full(&self) -> bool {
+        self.occupied >= self.capacity
+    }
+
+    /// Return the number of entries in this cache.
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
+    /// Remove an entry from the cache, and return `true` if it was present.
     pub async fn remove<Q>(&mut self, key: &Q) -> bool
     where
         K: Borrow<Q>,
@@ -133,13 +189,16 @@ impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
                 mem::swap(&mut prev.next, &mut item_lock.next);
             }
 
+            self.occupied -= V::weight();
+
             true
         } else {
             false
         }
     }
 
-    pub async fn traverse<F: FnMut(&V) -> () + Send>(&self, mut f: F) {
+    /// Traverse the cache values beginning with the least-frequent.
+    pub async fn traverse<C: FnMut(&V) -> () + Send>(&self, mut f: C) {
         let mut next = self.last.clone();
         while let Some(item) = next {
             let lock = item.read().await;
@@ -147,9 +206,38 @@ impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
             next = lock.next.clone();
         }
     }
+
+    /// Traverse the cache values beginning with the least-frequent, and evict the values from the
+    /// cache when the given callback returns `Ok(true)`, until `is_full` returns false.
+    pub async fn evict<E, Fut: Future<Output = Result<bool, E>>, C: Fn(&K, &V) -> Fut + Send>(
+        &mut self,
+        f: C,
+    ) -> Result<(), E> {
+        let mut next = self.last.clone();
+        while let Some(item) = next {
+            let lock = item.read().await;
+            next = lock.next.clone();
+
+            if f(&lock.key, &lock.value).await? {
+                let (key, _) = self.cache.remove_entry(&lock.key).unwrap();
+
+                // self.remove will need a write lock, so drop the read lock
+                std::mem::drop(lock);
+                self.remove(&key).await;
+            }
+
+            if !self.is_full() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
-async fn bump<V>(item: &RwLock<Item<V>>) -> (Option<RwLock<Item<V>>>, Option<RwLock<Item<V>>>) {
+async fn bump<K, V>(
+    item: &RwLock<Item<K, V>>,
+) -> (Option<RwLock<Item<K, V>>>, Option<RwLock<Item<K, V>>>) {
     let mut item_lock = item.write().await;
 
     let last = if item_lock.next.is_none() {
@@ -198,7 +286,13 @@ mod tests {
 
     use super::*;
 
-    async fn print_debug<K, V: fmt::Display>(cache: &LFUCache<K, V>) {
+    impl Entry for i32 {
+        fn weight() -> u64 {
+            2
+        }
+    }
+
+    async fn print_debug<K, V: fmt::Display, F>(cache: &LFUCache<K, V, F>) {
         let mut next = cache.last.clone();
         while let Some(item) = next {
             let lock = item.read().await;
@@ -220,7 +314,7 @@ mod tests {
         println!();
     }
 
-    async fn validate<K, V: Copy + Eq + fmt::Debug>(cache: &LFUCache<K, V>) {
+    async fn validate<K, V: Copy + Eq + fmt::Debug, F>(cache: &LFUCache<K, V, F>) {
         let mut last = None;
         let mut next = cache.last.clone();
         while let Some(item) = next {
@@ -235,16 +329,9 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl Entry for i32 {
-        fn weight(&self) -> u64 {
-            2
-        }
-    }
-
     #[tokio::test]
     async fn test_order() {
-        let mut cache = LFUCache::new(100);
+        let mut cache = LFUCache::new(100, || {});
         let expected: Vec<i32> = (0..10).collect();
 
         for i in expected.iter().rev() {
@@ -253,12 +340,13 @@ mod tests {
 
         let mut actual = Vec::with_capacity(expected.len());
         cache.traverse(|i| actual.push(*i)).await;
+
         assert_eq!(actual, expected)
     }
 
     #[tokio::test]
     async fn test_access() {
-        let mut cache = LFUCache::new(100);
+        let mut cache = LFUCache::new(100, || {});
 
         let mut rng = thread_rng();
         for _ in 0..100_000 {
@@ -271,6 +359,7 @@ mod tests {
 
             let mut size = 0;
             cache.traverse(|_| size += 1).await;
+
             assert_eq!(cache.len(), size);
 
             let i: i32 = rng.gen_range(0..10);
@@ -283,6 +372,7 @@ mod tests {
 
             let mut size = 0;
             cache.traverse(|_| size += 1).await;
+
             assert_eq!(cache.len(), size);
         }
     }
