@@ -12,6 +12,7 @@ categories = ["asynchronous", "caching", "concurrency", "data-structures"]
 keywords = ["lfu", "cache", "custom", "eviction"]
 
 [dependencies]
+async-trait = "0.1"
 futures = "0.3"
 uplock = "0.1"
 

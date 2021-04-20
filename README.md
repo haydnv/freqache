@@ -3,29 +3,34 @@ A weighted, thread-safe, futures-aware Rust LFU cache which supports a custom ev
 
 Example:
 ```rust
-use std::time::Duration;
-use futures::executor::block_on;
-use freqache::{Entry, LFUCache};
+use freqache::LFUCache;
 
 #[derive(Clone)]
-struct Item;
+struct Entry;
 
-impl Entry for Item {
-    fn weight() -> u64 {
+impl freqache::Entry for Entry {
+    fn weight(&self) -> u64 {
         1
     }
 }
 
-struct Evict;
+struct Policy;
 
-let (tx, rx) = std::sync::mpsc::channel();
-let mut cache = LFUCache::new(100, || { tx.send(Evict); });
-cache.insert("key", Item);
+#[async_trait]
+impl freqache::Policy<String, Entry> for Policy {
+    fn can_evict(&self, value: &Entry) -> bool {
+        true
+    }
 
-while rx.recv_timeout(Duration::default()).is_ok() {
-    cache.evict(|key, value| {
-        // maybe backup the contents of the entry here
-        futures::future::ready(Result::<bool, String>::Ok(true))
-    });
+    async fn evict(&self, key: String, value: &Entry) {
+        // maybe backup the entry contents here
+    }
+}
+
+let mut cache = LFUCache::new(1, Policy);
+cache.insert("key".to_string(), Entry);
+
+if cache.is_full() {
+    cache.evict().await;
 }
 ```
