@@ -13,7 +13,7 @@
 //! struct Item;
 //!
 //! impl Entry for Item {
-//!     fn weight() -> u64 {
+//!     fn weight(&self) -> u64 {
 //!         1
 //!     }
 //! }
@@ -42,7 +42,9 @@ use uplock::RwLock;
 
 /// An [`LFUCache`] entry
 pub trait Entry: Clone {
-    fn weight() -> u64;
+    /// The weight of this item in the cache.
+    /// This value must be stable over the lifetime of the item.
+    fn weight(&self) -> u64;
 }
 
 struct Item<K, V> {
@@ -57,8 +59,8 @@ pub struct LFUCache<K, V, F> {
     cache: HashMap<K, RwLock<Item<K, V>>>,
     first: Option<RwLock<Item<K, V>>>,
     last: Option<RwLock<Item<K, V>>>,
-    occupied: u64,
-    capacity: u64,
+    occupied: i64,
+    capacity: i64,
     policy: F,
 }
 
@@ -70,7 +72,7 @@ impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
             first: None,
             last: None,
             occupied: 0,
-            capacity,
+            capacity: capacity as i64,
             policy,
         }
     }
@@ -125,7 +127,7 @@ impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
             let mut last = None;
             mem::swap(&mut self.last, &mut last);
 
-            self.occupied += V::weight();
+            self.occupied += value.weight() as i64;
             if self.occupied > self.capacity {
                 (self.policy)();
             }
@@ -189,7 +191,7 @@ impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
                 mem::swap(&mut prev.next, &mut item_lock.next);
             }
 
-            self.occupied -= V::weight();
+            self.occupied -= item_lock.value.weight() as i64;
 
             true
         } else {
@@ -287,7 +289,7 @@ mod tests {
     use super::*;
 
     impl Entry for i32 {
-        fn weight() -> u64 {
+        fn weight(&self) -> u64 {
             2
         }
     }
