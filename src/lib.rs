@@ -36,8 +36,9 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
+use std::ops::Deref;
 
-use futures::{join, Future, FutureExt};
+use futures::{join, Future};
 use uplock::RwLock;
 
 /// An [`LFUCache`] entry
@@ -52,6 +53,14 @@ struct Item<K, V> {
     value: V,
     prev: Option<RwLock<Self>>,
     next: Option<RwLock<Self>>,
+}
+
+impl<K, V> Deref for Item<K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &V {
+        &self.value
+    }
 }
 
 /// A weighted, thread-safe, futures-aware least-frequently-used cache
@@ -86,8 +95,11 @@ impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
         self.cache.contains_key(key)
     }
 
-    /// Clone and return the value of the cache entry with the given key.
-    pub async fn get<Q: ?Sized>(&mut self, key: &Q) -> Option<V>
+    /// Borrow the value of the cache entry with the given key.
+    pub async fn get<Q: ?Sized>(
+        &mut self,
+        key: &Q,
+    ) -> Option<impl Deref<Target = impl Deref<Target = V>>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -103,7 +115,7 @@ impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
                 self.first = first;
             }
 
-            Some(item.read().map(|lock| lock.value.clone()).await)
+            Some(item.read().await)
         } else {
             None
         }
@@ -159,8 +171,8 @@ impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
         self.cache.len()
     }
 
-    /// Remove an entry from the cache, and return `true` if it was present.
-    pub async fn remove<Q>(&mut self, key: &Q) -> bool
+    /// Remove an entry from the cache, and clone and return its value if present.
+    pub async fn remove<Q>(&mut self, key: &Q) -> Option<V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -193,9 +205,9 @@ impl<K: Clone + Eq + Hash, V: Entry, F: Fn() -> ()> LFUCache<K, V, F> {
 
             self.occupied -= item_lock.value.weight() as i64;
 
-            true
+            Some(item_lock.value.clone())
         } else {
-            false
+            None
         }
     }
 
