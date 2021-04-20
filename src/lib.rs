@@ -2,14 +2,13 @@ use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
-use std::ops::Deref;
 
 use async_trait::async_trait;
 use futures::{join, FutureExt};
-use uplock::{RwLock, RwLockReadGuard};
+use uplock::RwLock;
 
 #[async_trait]
-pub trait Entry {
+pub trait Entry: Clone {
     fn weight(&self) -> u64;
 }
 
@@ -26,7 +25,7 @@ pub struct LFUCache<K, V> {
     capacity: u64,
 }
 
-impl<K: Eq + Hash, V: Clone> LFUCache<K, V> {
+impl<K: Eq + Hash, V: Entry> LFUCache<K, V> {
     pub fn new(capacity: u64) -> Self {
         Self {
             cache: HashMap::new(),
@@ -103,18 +102,13 @@ impl<K: Eq + Hash, V: Clone> LFUCache<K, V> {
         self.cache.len()
     }
 
-    // TODO: could this return a Stream of &V?
-    pub async fn values(&self) -> Vec<V> {
-        let mut keys = Vec::with_capacity(self.cache.len());
-
+    pub async fn traverse<F: FnMut(&V) -> () + Send>(&self, mut f: F) {
         let mut next = self.last.clone();
         while let Some(item) = next {
             let lock = item.read().await;
-            keys.push(lock.deref().value.clone());
+            f(&lock.value);
             next = lock.next.clone();
         }
-
-        keys
     }
 }
 
@@ -149,7 +143,7 @@ async fn bump<V>(item: &RwLock<Item<V>>) -> (Option<RwLock<Item<V>>>, Option<RwL
         mem::swap(&mut item_lock.next, &mut next_lock.next); // set item.next
         mem::swap(&mut next_lock.prev, &mut item_lock.prev); // set next.prev
 
-        item_lock.prev = next;
+        item_lock.prev = next; // set item.prev
 
         let first = if item_lock.next.is_none() {
             Some(item.clone())
@@ -163,19 +157,29 @@ async fn bump<V>(item: &RwLock<Item<V>>) -> (Option<RwLock<Item<V>>>, Option<RwL
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rand::{thread_rng, Rng};
+
+    use super::*;
+
+    #[async_trait]
+    impl Entry for i32 {
+        fn weight(&self) -> u64 {
+            2
+        }
+    }
 
     #[tokio::test]
     async fn test_order() {
         let mut cache = LFUCache::new(100);
-        let values: Vec<i32> = (0..10).collect();
+        let expected: Vec<i32> = (0..10).collect();
 
-        for i in values.iter().rev() {
+        for i in expected.iter().rev() {
             cache.insert(i, *i).await;
         }
 
-        assert_eq!(cache.values().await, values)
+        let mut actual = Vec::with_capacity(expected.len());
+        cache.traverse(|i| actual.push(*i)).await;
+        assert_eq!(actual, expected)
     }
 
     #[tokio::test]
@@ -207,7 +211,9 @@ mod tests {
             }
 
             println!();
-            assert_eq!(cache.len(), cache.values().await.len());
+            let mut size = 0;
+            cache.traverse(|_| size += 1).await;
+            assert_eq!(cache.len(), size);
         }
     }
 }
