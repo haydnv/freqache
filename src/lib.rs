@@ -172,9 +172,20 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
             }
 
             self.cache.insert(key, item.clone());
+
+            if self.first.is_none() {
+                self.first = Some(item.clone());
+            }
+
             self.last = Some(item);
+
             false
         }
+    }
+
+    /// Return `true` if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
     }
 
     /// Return `true` if the cache is full.
@@ -237,7 +248,7 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
         }
     }
 
-    /// Traverse the cache values beginning with the least-frequent, and evict values from the
+    /// Traverse the cache entries beginning with the least-frequent, and evict entries from the
     /// cache according to this its [`Policy`].
     pub async fn evict(&mut self) {
         let mut next = self.last.clone();
@@ -245,12 +256,29 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
             let lock = item.read().await;
             next = lock.next.clone();
 
-            if self.policy.can_evict(&lock.value) {
-                let (key, value) = self.cache.remove_entry(&lock.key).unwrap();
-                let lock = value.read().await;
-                self.policy.evict(key, &lock.value).await;
+            if !self.policy.can_evict(&lock.value) {
+                continue;
             }
 
+            let (key, value) = self.cache.remove_entry(&lock.key).expect("cache key");
+            let mut lock = value.write().await;
+            self.policy.evict(key, &lock.value).await;
+
+            if let Some(prev) = &lock.prev {
+                let mut prev = prev.write().await;
+                mem::swap(&mut lock.next, &mut prev.next);
+            } else {
+                self.last = next.clone();
+            }
+
+            if let Some(next) = &next {
+                let mut next = next.write().await;
+                mem::swap(&mut lock.prev, &mut next.prev);
+            } else {
+                self.first = lock.prev.clone();
+            }
+
+            self.capacity -= lock.value.weight() as i64;
             if !self.is_full() {
                 break;
             }
@@ -328,6 +356,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     async fn print_debug<K, V: fmt::Display, P>(cache: &LFUCache<K, V, P>) {
         let mut next = cache.last.clone();
         while let Some(item) = next {
@@ -350,7 +379,17 @@ mod tests {
         println!();
     }
 
-    async fn validate<K, V: Copy + Eq + fmt::Debug, P>(cache: &LFUCache<K, V, P>) {
+    async fn validate<K: Clone + Eq + Hash, V: Entry + Copy + Eq + fmt::Debug, P: Policy<K, V>>(
+        cache: &LFUCache<K, V, P>,
+    ) {
+        if cache.is_empty() {
+            assert!(cache.first.is_none());
+            assert!(cache.last.is_none());
+        } else {
+            assert!(cache.first.as_ref().unwrap().read().await.next.is_none());
+            assert!(cache.last.as_ref().unwrap().read().await.prev.is_none());
+        }
+
         let mut last = None;
         let mut next = cache.last.clone();
         while let Some(item) = next {
@@ -387,24 +426,18 @@ mod tests {
         let mut rng = thread_rng();
         for _ in 0..100_000 {
             let i: i32 = rng.gen_range(0..10);
-            println!("insert {}", i);
             cache.insert(i, i).await;
-
-            print_debug(&cache).await;
-            validate(&cache).await;
-
-            let mut size = 0;
-            cache.traverse(|_| size += 1).await;
-
-            assert_eq!(cache.len(), size);
+            validate(&mut cache).await;
 
             let i: i32 = rng.gen_range(0..10);
-            println!("remove {}", i);
             cache.remove(&i).await;
+            validate(&mut cache).await;
 
-            print_debug(&cache).await;
-            validate(&cache).await;
-            assert!(!cache.contains_key(&i));
+            if cache.is_full() {
+                cache.evict().await;
+            }
+
+            assert!(!cache.is_full());
 
             let mut size = 0;
             cache.traverse(|_| size += 1).await;
