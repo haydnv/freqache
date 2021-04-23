@@ -1,6 +1,6 @@
 [package]
 name = "freqache"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["haydnv"]
 edition = "2018"
 license = "Apache-2.0"
@@ -14,6 +14,7 @@ keywords = ["lfu", "cache", "custom", "eviction"]
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
+log = "0.4"
 uplock = "0.1"
 
 [dev-dependencies]

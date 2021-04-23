@@ -41,6 +41,7 @@
 
 use std::borrow::Borrow;
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::Hash;
 use std::mem;
 use std::ops::Deref;
@@ -250,18 +251,19 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
 
     /// Traverse the cache entries beginning with the least-frequent, and evict entries from the
     /// cache according to this its [`Policy`].
-    pub async fn evict(&mut self) {
+    pub async fn evict(&mut self) where K: fmt::Debug {
         let mut next = self.last.clone();
         while let Some(item) = next {
             let lock = item.read().await;
+
             next = lock.next.clone();
 
             if !self.policy.can_evict(&lock.value) {
                 continue;
             }
 
-            let (key, value) = self.cache.remove_entry(&lock.key).expect("cache key");
-            let mut lock = value.write().await;
+            let (key, _) = self.cache.remove_entry(&lock.key).expect("cache key");
+            let mut lock = lock.upgrade().await;
             self.policy.evict(key, &lock.value).await;
 
             if let Some(prev) = &lock.prev {
