@@ -85,8 +85,8 @@ pub struct LFUCache<K, V, P> {
     cache: HashMap<K, RwLock<Item<K, V>>>,
     first: Option<RwLock<Item<K, V>>>,
     last: Option<RwLock<Item<K, V>>>,
-    occupied: i64,
-    capacity: i64,
+    occupied: u64,
+    capacity: u64,
     policy: P,
 }
 
@@ -98,7 +98,7 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
             first: None,
             last: None,
             occupied: 0,
-            capacity: capacity as i64,
+            capacity,
             policy,
         }
     }
@@ -159,7 +159,7 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
             let mut last = None;
             mem::swap(&mut self.last, &mut last);
 
-            self.occupied += value.weight() as i64;
+            self.occupied += value.weight();
 
             let item = RwLock::new(Item {
                 key: key.clone(),
@@ -185,12 +185,16 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
     }
 
     /// Return the unoccupied capacity of this cache.
-    pub fn available(&self) -> i64 {
-        self.capacity - self.occupied
+    pub fn available(&self) -> u64 {
+        if self.capacity > self.occupied {
+            self.capacity - self.occupied
+        } else {
+            0
+        }
     }
 
     /// Return the capacity of this cache.
-    pub fn capacity(&self) -> i64 {
+    pub fn capacity(&self) -> u64 {
         self.capacity
     }
 
@@ -210,7 +214,7 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
     }
 
     /// Return the currently occupied capacity of this cache.
-    pub fn occupied(&self) -> i64 {
+    pub fn occupied(&self) -> u64 {
         self.occupied
     }
 
@@ -246,7 +250,11 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
                 mem::swap(&mut prev.next, &mut item_lock.next);
             }
 
-            self.occupied -= item_lock.value.weight() as i64;
+            if self.occupied > item_lock.value.weight() {
+                self.occupied -= item_lock.value.weight();
+            } else {
+                self.occupied = 0;
+            }
 
             Some(item_lock.value.clone())
         } else {
@@ -298,7 +306,12 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
                 self.first = lock.prev.clone();
             }
 
-            self.capacity -= lock.value.weight() as i64;
+            if self.occupied > lock.value.weight() {
+                self.occupied -= lock.value.weight();
+            } else {
+                self.occupied = 0;
+            }
+
             if !self.is_full() {
                 break;
             }
