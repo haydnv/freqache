@@ -184,6 +184,16 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
         }
     }
 
+    /// Return the unoccupied capacity of this cache.
+    pub fn available(&self) -> i64 {
+        self.capacity - self.occupied
+    }
+
+    /// Return the capacity of this cache.
+    pub fn capacity(&self) -> i64 {
+        self.capacity
+    }
+
     /// Return `true` if the cache is empty.
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
@@ -197,6 +207,11 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
     /// Return the number of entries in this cache.
     pub fn len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Return the currently occupied capacity of this cache.
+    pub fn occupied(&self) -> i64 {
+        self.occupied
     }
 
     /// Remove an entry from the cache, and clone and return its value if present.
@@ -251,7 +266,10 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
 
     /// Traverse the cache entries beginning with the least-frequent, and evict entries from the
     /// cache according to this its [`Policy`].
-    pub async fn evict(&mut self) where K: fmt::Debug {
+    pub async fn evict(&mut self)
+    where
+        K: fmt::Debug,
+    {
         let mut next = self.last.clone();
         while let Some(item) = next {
             let lock = item.read().await;
