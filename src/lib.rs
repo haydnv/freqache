@@ -1,4 +1,6 @@
-//! A weighted, thread-safe, futures-aware least-frequently-used cache.
+//! A weighted, futures-aware least-frequently-used cache.
+//!
+//! [`LFUCache`] by itself is not thread-safe; for thread safety you can use a `tokio::sync::Mutex`.
 //!
 //! [`LFUCache`] does not provide a default eviction policy, but a callback and traversal method
 //! which allow the developer to implement their own.
@@ -9,7 +11,7 @@
 //! # use futures::executor::block_on;
 //! use freqache::LFUCache;
 //!
-//! #[derive(Clone)]
+//! #[derive(Clone, Debug, Eq, PartialEq)]
 //! struct Entry;
 //!
 //! impl freqache::Entry for Entry {
@@ -40,19 +42,16 @@
 //! ```
 
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt;
 use std::hash::Hash;
 use std::mem;
 use std::ops::Deref;
-use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::join;
-use tokio::sync::RwLock;
 
 /// An [`LFUCache`] entry
-pub trait Entry: Clone {
+pub trait Entry {
     /// The weight of this item in the cache.
     /// This value must be stable over the lifetime of the item.
     fn weight(&self) -> u64;
@@ -66,11 +65,14 @@ pub trait Policy<K, V>: Sized + Send {
     async fn evict(&self, key: K, value: &V);
 }
 
+struct Inner<K> {
+    prev: Option<K>,
+    next: Option<K>,
+}
+
 struct Item<K, V> {
-    key: K,
     value: V,
-    prev: Option<Arc<RwLock<Self>>>,
-    next: Option<Arc<RwLock<Self>>>,
+    inner: RefCell<Inner<K>>,
 }
 
 impl<K, V> Deref for Item<K, V> {
@@ -83,9 +85,9 @@ impl<K, V> Deref for Item<K, V> {
 
 /// A weighted, thread-safe, futures-aware least-frequently-used cache
 pub struct LFUCache<K, V, P> {
-    cache: HashMap<K, Arc<RwLock<Item<K, V>>>>,
-    first: Option<Arc<RwLock<Item<K, V>>>>,
-    last: Option<Arc<RwLock<Item<K, V>>>>,
+    cache: HashMap<K, Item<K, V>>,
+    first: Option<K>,
+    last: Option<K>,
     occupied: u64,
     capacity: u64,
     policy: P,
@@ -114,16 +116,9 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
     }
 
     /// Borrow the value of the cache entry with the given key.
-    pub async fn get<Q: ?Sized>(
-        &mut self,
-        key: &Q,
-    ) -> Option<impl Deref<Target = impl Deref<Target = V>>>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        if let Some(item) = self.cache.get(key) {
-            let (last, first) = bump(item.clone()).await;
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        if self.cache.contains_key(key) {
+            let (last, first) = self.bump(key.clone());
 
             if last.is_some() {
                 self.last = last;
@@ -133,16 +128,21 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
                 self.first = first;
             }
 
-            Some(item.clone().read_owned().await)
+            self.cache.get(key).map(|item| item.deref())
         } else {
             None
         }
     }
 
     /// Add a new entry to the cache.
-    pub async fn insert(&mut self, key: K, value: V) -> bool {
-        if let Some(item) = self.cache.get(&key) {
-            let (last, first) = bump(item.clone()).await;
+    pub fn insert(&mut self, key: K, value: V) -> bool {
+        let present = if self.cache.contains_key(&key) {
+            {
+                let mut item = self.cache.get_mut(&key).expect("item");
+                item.value = value;
+            }
+
+            let (last, first) = self.bump(key);
 
             if last.is_some() {
                 self.last = last;
@@ -152,37 +152,37 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
                 self.first = first;
             }
 
-            let mut lock = item.write().await;
-            lock.value = value;
-
             true
         } else {
-            let mut last = None;
-            mem::swap(&mut self.last, &mut last);
+            let prev = None;
+            let mut next = Some(key.clone());
+            mem::swap(&mut self.last, &mut next);
 
             self.occupied += value.weight();
 
-            let item = Arc::new(RwLock::new(Item {
-                key: key.clone(),
-                value,
-                prev: None,
-                next: last,
-            }));
+            if let Some(next_key) = &next {
+                let mut next = self
+                    .cache
+                    .get(next_key)
+                    .expect("next item")
+                    .inner
+                    .borrow_mut();
 
-            if let Some(next) = &item.write().await.next {
-                next.write().await.prev = Some(item.clone());
+                next.prev = Some(key.clone());
             }
-
-            self.cache.insert(key, item.clone());
 
             if self.first.is_none() {
-                self.first = Some(item.clone());
+                self.first = Some(key.clone());
             }
 
-            self.last = Some(item);
+            let inner = RefCell::new(Inner { prev, next });
+            let item = Item { value, inner };
+            self.cache.insert(key, item);
 
             false
-        }
+        };
+
+        present
     }
 
     /// Return the unoccupied capacity of this cache.
@@ -220,159 +220,209 @@ impl<K: Clone + Eq + Hash, V: Entry, P: Policy<K, V>> LFUCache<K, V, P> {
     }
 
     /// Remove an entry from the cache, and clone and return its value if present.
-    pub async fn remove<Q>(&mut self, key: &Q) -> Option<V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
+    pub fn remove(&mut self, key: &K) -> Option<V> {
         if let Some(item) = self.cache.remove(key) {
-            let mut item_lock = item.clone().write_owned().await;
+            let mut inner = item.inner.borrow_mut();
 
-            if item_lock.prev.is_none() && item_lock.next.is_none() {
+            if inner.prev.is_none() && inner.next.is_none() {
+                // there was only one item and now the cache is empty
                 self.last = None;
                 self.first = None;
-            } else if item_lock.prev.is_none() {
-                let next = item_lock.next.clone().expect("next item");
+            } else if inner.prev.is_none() {
+                // the last item has been removed
+                self.last = inner.next.clone();
+                let next_key = inner.next.as_ref().expect("next key");
+                let mut next = self
+                    .cache
+                    .get(next_key)
+                    .expect("next item")
+                    .inner
+                    .borrow_mut();
 
-                {
-                    let mut next_lock = next.write().await;
-                    mem::swap(&mut next_lock.prev, &mut item_lock.prev);
-                }
+                mem::swap(&mut next.prev, &mut inner.prev);
+            } else if inner.next.is_none() {
+                // the first item has been removed
+                self.first = inner.prev.clone();
+                let prev_key = inner.prev.as_ref().expect("previous key");
+                let mut prev = self
+                    .cache
+                    .get(prev_key)
+                    .expect("previous item")
+                    .inner
+                    .borrow_mut();
 
-                self.last = Some(next);
-            } else if item_lock.next.is_none() {
-                let prev = item_lock.prev.clone().expect("previous item");
-
-                {
-                    let mut prev_lock = prev.write().await;
-                    mem::swap(&mut prev_lock.next, &mut item_lock.next);
-                }
-
-                self.first = Some(prev);
+                mem::swap(&mut prev.next, &mut inner.next);
             } else {
-                let prev = item_lock.prev.clone().expect("previous item");
-                let next = item_lock.next.clone().expect("next item");
-                let (mut prev_lock, mut next_lock) = join!(prev.write(), next.write());
+                // an item in the middle has been removed
+                let prev_key = inner.prev.as_ref().expect("previous key");
+                let mut prev = self
+                    .cache
+                    .get(prev_key)
+                    .expect("previous item")
+                    .inner
+                    .borrow_mut();
 
-                mem::swap(&mut next_lock.prev, &mut item_lock.prev);
-                mem::swap(&mut prev_lock.next, &mut item_lock.next);
+                let next_key = inner.next.as_ref().expect("next key");
+                let mut next = self
+                    .cache
+                    .get(next_key)
+                    .expect("next item")
+                    .inner
+                    .borrow_mut();
+
+                mem::swap(&mut next.prev, &mut inner.prev);
+                mem::swap(&mut prev.next, &mut inner.next);
             }
 
-            if self.occupied > item_lock.value.weight() {
-                self.occupied -= item_lock.value.weight();
+            if self.occupied > item.value.weight() {
+                self.occupied -= item.value.weight();
             } else {
                 self.occupied = 0;
             }
 
-            Some(item_lock.value.clone())
+            Some(item.value)
         } else {
             None
         }
     }
 
     /// Traverse the cache values beginning with the least-frequent.
-    pub async fn traverse<C: FnMut(&V) -> () + Send>(&self, mut f: C) {
+    pub fn traverse<C: FnMut(&V) -> () + Send>(&self, mut f: C) {
         let mut next = self.last.clone();
-        while let Some(item) = next {
-            let lock = item.read().await;
-            f(&lock.value);
-            next = lock.next.clone();
+        while let Some(key) = next {
+            let item = self.cache.get(&key).expect("next item");
+            f(&item.value);
+            next = item.inner.borrow().next.clone();
         }
     }
 
     /// Traverse the cache entries beginning with the least-frequent, and evict entries from the
     /// cache according to this its [`Policy`].
-    pub async fn evict(&mut self)
-    where
-        K: fmt::Debug,
-    {
-        let mut next = self.last.clone();
-        while let Some(item) = next {
-            let mut lock = item.write().await;
-
-            next = lock.next.clone();
-
-            if !self.policy.can_evict(&lock.value) {
-                continue;
+    pub async fn evict(&mut self) {
+        let mut current_key = self.last.clone();
+        while let Some(item_key) = current_key {
+            {
+                let item = self.cache.get(&item_key).expect("next item");
+                if !self.policy.can_evict(&item.value) {
+                    current_key = item.inner.borrow().next.clone();
+                    continue;
+                }
             }
 
-            let (key, _) = self.cache.remove_entry(&lock.key).expect("cache key");
-            self.policy.evict(key, &lock.value).await;
+            let (item_key_tmp, item) = self.cache.remove_entry(&item_key).expect("cache key");
 
-            if let Some(prev) = lock.prev.clone() {
-                let mut prev = prev.write().await;
-                mem::swap(&mut lock.next, &mut prev.next);
+            self.policy.evict(item_key_tmp, &item.value).await;
+
+            let value = item.value;
+            let mut item = item.inner.borrow_mut();
+            let next_key = item.next.clone();
+
+            if let Some(prev_key) = &item.prev {
+                let mut prev = self
+                    .cache
+                    .get(prev_key)
+                    .expect("previous item")
+                    .inner
+                    .borrow_mut();
+
+                mem::swap(&mut item.next, &mut prev.next);
             } else {
-                self.last = lock.next.clone();
+                self.last = item.next.clone();
             }
 
-            if let Some(next) = lock.next.clone() {
-                let mut next = next.write().await;
-                mem::swap(&mut lock.prev, &mut next.prev);
+            if let Some(next_key) = &next_key {
+                let mut next = self
+                    .cache
+                    .get(next_key)
+                    .expect("next item")
+                    .inner
+                    .borrow_mut();
+
+                mem::swap(&mut item.prev, &mut next.prev);
             } else {
-                self.first = lock.prev.clone();
+                self.first = item.prev.clone();
             }
 
-            if self.occupied > lock.value.weight() {
-                self.occupied -= lock.value.weight();
+            if self.occupied > value.weight() {
+                self.occupied -= value.weight();
             } else {
                 self.occupied = 0;
             }
 
-            if !self.is_full() {
+            if self.is_full() {
+                current_key = next_key;
+            } else {
                 break;
             }
         }
     }
+
+    fn bump(&mut self, key: K) -> (Option<K>, Option<K>) {
+        let mut item = if let Some(item) = self.cache.get(&key) {
+            item.inner.borrow_mut()
+        } else {
+            return (None, None);
+        };
+
+        let last = if item.next.is_none() {
+            // can't bump the first item
+            return (None, None);
+        } else if item.prev.is_none() && item.next.is_some() {
+            // bump the last item
+
+            let next_key = item.next.as_ref().expect("next key");
+            let mut next = self
+                .cache
+                .get(next_key)
+                .expect("next item")
+                .inner
+                .borrow_mut();
+
+            mem::swap(&mut next.prev, &mut item.prev); // set next.prev
+            mem::swap(&mut item.next, &mut next.next); // set item.next
+            mem::swap(&mut item.prev, &mut next.next); // set item.prev & next.next
+
+            item.prev.clone()
+        } else {
+            // bump an item in the middle
+
+            let prev_key = item.prev.as_ref().expect("previous key");
+            let mut prev = self
+                .cache
+                .get(prev_key)
+                .expect("previous item")
+                .inner
+                .borrow_mut();
+
+            let next_key = item.next.as_ref().expect("next key").clone();
+            let mut next = self
+                .cache
+                .get(&next_key)
+                .expect("next item")
+                .inner
+                .borrow_mut();
+
+            mem::swap(&mut prev.next, &mut item.next); // set prev.next
+            mem::swap(&mut item.next, &mut next.next); // set item.next
+            mem::swap(&mut next.prev, &mut item.prev); // set next.prev
+
+            item.prev = Some(next_key); // set item.prev
+
+            None
+        };
+
+        let first = if let Some(next_key) = &item.next {
+            let skip = self.cache.get(next_key).expect("skipped item");
+            let mut inner = skip.inner.borrow_mut();
+            inner.prev = Some(key);
+            None
+        } else {
+            Some(key)
+        };
+
+        (last, first)
+    }
 }
-
-async fn bump<K, V>(
-    item: Arc<RwLock<Item<K, V>>>,
-) -> (
-    Option<Arc<RwLock<Item<K, V>>>>,
-    Option<Arc<RwLock<Item<K, V>>>>,
-) {
-    let mut item_lock = item.clone().write_owned().await;
-
-    let last = if item_lock.next.is_none() {
-        return (None, None); // nothing to update
-    } else if item_lock.prev.is_none() && item_lock.next.is_some() {
-        let next = item_lock.next.clone().unwrap();
-        let mut next_lock = next.write().await;
-
-        mem::swap(&mut next_lock.prev, &mut item_lock.prev); // set next.prev
-        mem::swap(&mut item_lock.next, &mut next_lock.next); // set item.next
-        mem::swap(&mut item_lock.prev, &mut next_lock.next); // set item.prev & next.next
-
-        item_lock.prev.clone()
-    } else {
-        let prev = item_lock.prev.clone().expect("previous item");
-        let next = item_lock.next.clone().expect("next item");
-
-        {
-            let (mut prev_lock, mut next_lock) = join!(prev.write(), next.write());
-
-            mem::swap(&mut prev_lock.next, &mut item_lock.next); // set prev.next
-            mem::swap(&mut item_lock.next, &mut next_lock.next); // set item.next
-            mem::swap(&mut next_lock.prev, &mut item_lock.prev); // set next.prev
-        }
-
-        item_lock.prev = Some(next); // set item.prev
-
-        None
-    };
-
-    let first = if item_lock.next.is_some() {
-        let mut skip_lock = item_lock.next.as_ref().unwrap().write().await;
-        skip_lock.prev = Some(item);
-        None
-    } else {
-        Some(item)
-    };
-
-    (last, first)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fmt;
@@ -380,6 +430,68 @@ mod tests {
     use rand::{thread_rng, Rng};
 
     use super::*;
+
+    #[allow(dead_code)]
+    async fn print_debug<K: Clone + Eq + Hash, V: fmt::Display, P>(cache: &LFUCache<K, V, P>) {
+        let mut next = cache.last.clone();
+        while let Some(next_key) = next {
+            let item = cache.cache.get(&next_key).expect("item");
+            let inner = item.inner.borrow();
+
+            if let Some(prev_key) = inner.prev.as_ref() {
+                let prev = cache.cache.get(prev_key).expect("previous item");
+                print!("{}-", prev.value);
+            }
+
+            print!("{}", item.value);
+
+            next = inner.next.clone();
+            if let Some(next_key) = &next {
+                let next = cache.cache.get(next_key).expect("next item");
+                print!("-{}", next.value);
+            }
+
+            print!(" ");
+        }
+
+        println!();
+    }
+
+    fn validate<K: fmt::Debug + Clone + Eq + Hash, V: Entry, P: Policy<K, V>>(
+        cache: &LFUCache<K, V, P>,
+    ) {
+        if cache.is_empty() {
+            assert!(cache.first.is_none());
+            assert!(cache.last.is_none());
+        } else {
+            let first_key = cache.first.as_ref().expect("first key");
+            let first = cache
+                .cache
+                .get(first_key)
+                .expect("first item")
+                .inner
+                .borrow();
+            assert!(first.next.is_none());
+
+            let last_key = cache.last.as_ref().expect("last key");
+            let last = cache.cache.get(last_key).expect("last item").inner.borrow();
+            assert!(last.prev.is_none());
+        }
+
+        let mut last = None;
+        let mut next = cache.last.clone();
+        while let Some(key) = next {
+            let item = cache.cache.get(&key).expect("item").inner.borrow();
+
+            if let Some(last_key) = &last {
+                let prev_key = item.prev.as_ref().expect("previous key");
+                assert_eq!(last_key, prev_key);
+            }
+
+            last = Some(key);
+            next = item.next.clone();
+        }
+    }
 
     impl Entry for i32 {
         fn weight(&self) -> u64 {
@@ -400,65 +512,17 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
-    async fn print_debug<K, V: fmt::Display, P>(cache: &LFUCache<K, V, P>) {
-        let mut next = cache.last.clone();
-        while let Some(item) = next {
-            let lock = item.read().await;
-
-            if let Some(item) = lock.prev.as_ref() {
-                print!("{}-", item.read().await.value);
-            }
-
-            print!("{}", lock.value);
-
-            next = lock.next.clone();
-            if let Some(item) = &next {
-                print!("-{}", item.read().await.value);
-            }
-
-            print!(" ");
-        }
-
-        println!();
-    }
-
-    async fn validate<K: Clone + Eq + Hash, V: Entry + Copy + Eq + fmt::Debug, P: Policy<K, V>>(
-        cache: &LFUCache<K, V, P>,
-    ) {
-        if cache.is_empty() {
-            assert!(cache.first.is_none());
-            assert!(cache.last.is_none());
-        } else {
-            assert!(cache.first.as_ref().unwrap().read().await.next.is_none());
-            assert!(cache.last.as_ref().unwrap().read().await.prev.is_none());
-        }
-
-        let mut last = None;
-        let mut next = cache.last.clone();
-        while let Some(item) = next {
-            let lock = item.read().await;
-
-            if let Some(last) = last {
-                assert_eq!(lock.prev.as_ref().unwrap().read().await.value, last);
-            }
-
-            last = Some(lock.value);
-            next = lock.next.clone();
-        }
-    }
-
     #[tokio::test]
     async fn test_order() {
         let mut cache = LFUCache::new(100, Evict);
         let expected: Vec<i32> = (0..10).collect();
 
         for i in expected.iter().rev() {
-            cache.insert(*i, *i).await;
+            cache.insert(*i, *i);
         }
 
         let mut actual = Vec::with_capacity(expected.len());
-        cache.traverse(|i| actual.push(*i)).await;
+        cache.traverse(|i| actual.push(*i));
 
         assert_eq!(actual, expected)
     }
@@ -470,21 +534,24 @@ mod tests {
         let mut rng = thread_rng();
         for _ in 0..100_000 {
             let i: i32 = rng.gen_range(0..10);
-            cache.insert(i, i).await;
-            validate(&mut cache).await;
+            cache.insert(i, i);
+            validate(&mut cache);
 
             let i: i32 = rng.gen_range(0..10);
-            cache.remove(&i).await;
-            validate(&mut cache).await;
+            cache.remove(&i);
+            validate(&mut cache);
 
-            if cache.is_full() {
-                cache.evict().await;
+            if rng.gen_bool(0.01) {
+                if cache.is_full() {
+                    cache.evict().await;
+                }
+
+                assert!(!cache.is_full());
+                validate(&mut cache);
             }
 
-            assert!(!cache.is_full());
-
             let mut size = 0;
-            cache.traverse(|_| size += 1).await;
+            cache.traverse(|_| size += 1);
 
             assert_eq!(cache.len(), size);
         }

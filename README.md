@@ -1,11 +1,15 @@
 # freqache
-A weighted, thread-safe, futures-aware Rust LFU cache which supports a custom eviction policy.
+A weighted, futures-aware Rust LFU cache which supports a custom eviction policy.
+
+`LFUCache` is not thread-safe by itself; for thread safety, use a `tokio::sync::Mutex`.
 
 Example:
 ```rust
+use async_trait::async_trait;
+use futures::executor::block_on;
 use freqache::LFUCache;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Entry;
 
 impl freqache::Entry for Entry {
@@ -31,6 +35,6 @@ let mut cache = LFUCache::new(1, Policy);
 cache.insert("key".to_string(), Entry);
 
 if cache.is_full() {
-    cache.evict().await;
+    block_on(cache.evict());
 }
 ```
