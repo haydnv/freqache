@@ -16,19 +16,32 @@
 //! ```
 
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
-use std::sync::{RwLock, RwLockReadGuard};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-struct Item<K> {
+struct Inner<K> {
     prev: Option<K>,
     next: Option<K>,
 }
 
+struct Item<K> {
+    inner: RwLock<Inner<K>>,
+}
+
+impl<K> Item<K> {
+    fn read(&self) -> RwLockReadGuard<Inner<K>> {
+        self.inner.read().expect("item")
+    }
+
+    fn write(&self) -> RwLockWriteGuard<Inner<K>> {
+        self.inner.write().expect("item")
+    }
+}
+
 pub struct State<K> {
-    cache: HashMap<K, RefCell<Item<K>>>,
+    cache: HashMap<K, Item<K>>,
     first: Option<K>,
     last: Option<K>,
 }
@@ -36,7 +49,7 @@ pub struct State<K> {
 impl<K: Clone + Eq + Hash> State<K> {
     fn bump(&mut self, key: K) {
         let mut item = if let Some(item) = self.cache.get(&key) {
-            item.borrow_mut()
+            item.write()
         } else {
             return;
         };
@@ -48,7 +61,7 @@ impl<K: Clone + Eq + Hash> State<K> {
             // bump the last item
 
             let next_key = item.next.as_ref().expect("next key");
-            let mut next = self.cache.get(next_key).expect("next item").borrow_mut();
+            let mut next = self.cache.get(next_key).expect("next item").write();
 
             mem::swap(&mut next.prev, &mut item.prev); // set next.prev
             mem::swap(&mut item.next, &mut next.next); // set item.next
@@ -59,14 +72,10 @@ impl<K: Clone + Eq + Hash> State<K> {
             // bump an item in the middle
 
             let prev_key = item.prev.as_ref().expect("previous key");
-            let mut prev = self
-                .cache
-                .get(prev_key)
-                .expect("previous item")
-                .borrow_mut();
+            let mut prev = self.cache.get(prev_key).expect("previous item").write();
 
             let next_key = item.next.as_ref().expect("next key").clone();
-            let mut next = self.cache.get(&next_key).expect("next item").borrow_mut();
+            let mut next = self.cache.get(&next_key).expect("next item").write();
 
             mem::swap(&mut prev.next, &mut item.next); // set prev.next
             mem::swap(&mut item.next, &mut next.next); // set item.next
@@ -78,7 +87,7 @@ impl<K: Clone + Eq + Hash> State<K> {
         };
 
         let first = if let Some(next_key) = &item.next {
-            let mut skip = self.cache.get(next_key).expect("skipped item").borrow_mut();
+            let mut skip = self.cache.get(next_key).expect("skipped item").write();
             skip.prev = Some(key);
             None
         } else {
@@ -126,11 +135,13 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
         state.cache.contains_key(key)
     }
 
-    /// Add a new entry to the cache.
+    /// Add a new key to the cache and return `true` is it was already present, otherwise `false`.
+    ///
+    /// If already present, the key's priority is increased by one.
     pub fn insert(&self, key: K) -> bool {
         let mut state = self.state.write().expect("LFU write lock");
 
-        let present = if state.cache.contains_key(&key) {
+        if state.cache.contains_key(&key) {
             state.bump(key);
             true
         } else {
@@ -139,7 +150,7 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
             mem::swap(&mut state.last, &mut next);
 
             if let Some(next_key) = &next {
-                let mut next = state.cache.get(next_key).expect("next item").borrow_mut();
+                let mut next = state.cache.get(next_key).expect("next item").write();
 
                 next.prev = Some(key.clone());
             }
@@ -148,13 +159,13 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
                 state.first = Some(key.clone());
             }
 
-            let item = RefCell::new(Item { prev, next });
+            let item = Item {
+                inner: RwLock::new(Inner { prev, next }),
+            };
             state.cache.insert(key, item);
 
             false
-        };
-
-        present
+        }
     }
 
     /// Return `true` if the cache is empty.
@@ -167,12 +178,12 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
         self.state.read().expect("LFU cache state").cache.len()
     }
 
-    /// Remove an entry from the cache, and clone and return its value if present.
+    /// Remove an entry from the cache and return `true` if it was present or `false` if not.
     pub fn remove(&self, key: &K) -> bool {
         let mut state = self.state.write().expect("LFU cache state");
 
         if let Some(item) = state.cache.remove(key.borrow()) {
-            let mut inner = item.borrow_mut();
+            let mut inner = item.write();
 
             if inner.prev.is_none() && inner.next.is_none() {
                 // there was only one item and now the cache is empty
@@ -183,31 +194,23 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
                 state.last = inner.next.clone();
 
                 let next_key = inner.next.as_ref().expect("next key");
-                let mut next = state.cache.get(&*next_key).expect("next item").borrow_mut();
+                let mut next = state.cache.get(&*next_key).expect("next item").write();
 
                 mem::swap(&mut next.prev, &mut inner.prev);
             } else if inner.next.is_none() {
                 // the first item has been removed
                 state.first = inner.prev.clone();
                 let prev_key = inner.prev.as_ref().expect("previous key");
-                let mut prev = state
-                    .cache
-                    .get(prev_key)
-                    .expect("previous item")
-                    .borrow_mut();
+                let mut prev = state.cache.get(prev_key).expect("previous item").write();
 
                 mem::swap(&mut prev.next, &mut inner.next);
             } else {
                 // an item in the middle has been removed
                 let prev_key = inner.prev.as_ref().expect("previous key");
-                let mut prev = state
-                    .cache
-                    .get(prev_key)
-                    .expect("previous item")
-                    .borrow_mut();
+                let mut prev = state.cache.get(prev_key).expect("previous item").write();
 
                 let next_key = inner.next.as_ref().expect("next key");
-                let mut next = state.cache.get(&*next_key).expect("next item").borrow_mut();
+                let mut next = state.cache.get(&*next_key).expect("next item").write();
 
                 mem::swap(&mut next.prev, &mut inner.prev);
                 mem::swap(&mut prev.next, &mut inner.next);
@@ -220,6 +223,8 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
     }
 
     /// Iterate over the keys in the cache, beginning with the least-frequently used.
+    ///
+    /// Calling `insert` or `remove` while iterating will result in a deadlock.
     pub fn iter(&self) -> Iter<K> {
         let state = self.state.read().expect("LFU cache");
         let current = state.last.clone();
@@ -238,7 +243,7 @@ impl<'a, K: Clone + Eq + Hash> Iterator for Iter<'a, K> {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(key) = &mut self.current {
             let item = self.state.cache.get(key).expect("LFU cache item");
-            let mut next = item.borrow().next.clone();
+            let mut next = item.read().next.clone();
             mem::swap(&mut self.current, &mut next);
             next
         } else {
@@ -261,7 +266,7 @@ mod tests {
 
         let mut next = state.last.clone();
         while let Some(next_key) = next {
-            let item = state.cache.get(&next_key).expect("item").borrow();
+            let item = state.cache.get(&next_key).expect("item").read();
 
             if let Some(prev_key) = item.prev.as_ref() {
                 print!("{}-", prev_key);
@@ -286,19 +291,19 @@ mod tests {
             assert!(state.last.is_none());
         } else {
             let first_key = state.first.as_ref().expect("first key");
-            let first = state.cache.get(first_key).expect("first item").borrow();
+            let first = state.cache.get(first_key).expect("first item").read();
 
             assert!(first.next.is_none());
 
             let last_key = state.last.as_ref().expect("last key");
-            let last = state.cache.get(last_key).expect("last item").borrow();
+            let last = state.cache.get(last_key).expect("last item").read();
             assert!(last.prev.is_none());
         }
 
         let mut last = None;
         let mut next = state.last.clone();
         while let Some(key) = next {
-            let item = state.cache.get(&key).expect("item").borrow();
+            let item = state.cache.get(&key).expect("item").read();
 
             if let Some(last_key) = &last {
                 let prev_key = item.prev.as_ref().expect("previous key");
@@ -340,10 +345,6 @@ mod tests {
             let i: i32 = rng.gen_range(0..10);
             cache.remove(&i);
             validate(&mut cache);
-
-            if rng.gen_bool(0.01) {
-                validate(&mut cache);
-            }
 
             let mut size = 0;
             for _ in cache.iter() {
