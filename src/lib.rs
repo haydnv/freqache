@@ -1,18 +1,26 @@
-//! A thread-safe least-frequently-used cache which provides an `Iterator`.
+//! A thread-safe set which provides an `Iterator` ordered by access frequency.
 //!
 //! Example:
 //! ```
 //! use freqache::LFUCache;
+//!
+//! const CACHE_SIZE: usize = 10;
 //!
 //! let mut cache = LFUCache::new();
 //! cache.insert("key1");
 //! cache.insert("key2");
 //! cache.insert("key3");
 //! cache.insert("key2");
+//! // ...
 //!
 //! for key in cache.iter() {
 //!     println!("key: {}", key);
 //! }
+//!
+//! while cache.len() > CACHE_SIZE {
+//!     cache.pop();
+//! }
+//!
 //! ```
 
 use std::borrow::Borrow;
@@ -104,6 +112,58 @@ impl<K: Clone + Eq + Hash> State<K> {
             (None, None) => {}
         }
     }
+
+    fn pop(&mut self) -> Option<K> {
+        let last = self.last.as_ref()?;
+
+        let (key, item) = self.cache.remove_entry(last).expect("last entry");
+        self.remove_inner(item);
+        Some(key)
+    }
+
+    fn remove_inner(&mut self, item: Item<K>) {
+        let mut inner = item.write();
+
+        if inner.prev.is_none() && inner.next.is_none() {
+            // there was only one item and now the cache is empty
+            self.last = None;
+            self.first = None;
+        } else if inner.prev.is_none() {
+            // the last item has been removed
+            self.last = inner.next.clone();
+
+            let next_key = inner.next.as_ref().expect("next key");
+            let mut next = self.cache.get(&*next_key).expect("next item").write();
+
+            mem::swap(&mut next.prev, &mut inner.prev);
+        } else if inner.next.is_none() {
+            // the first item has been removed
+            self.first = inner.prev.clone();
+            let prev_key = inner.prev.as_ref().expect("previous key");
+            let mut prev = self.cache.get(prev_key).expect("previous item").write();
+
+            mem::swap(&mut prev.next, &mut inner.next);
+        } else {
+            // an item in the middle has been removed
+            let prev_key = inner.prev.as_ref().expect("previous key");
+            let mut prev = self.cache.get(prev_key).expect("previous item").write();
+
+            let next_key = inner.next.as_ref().expect("next key");
+            let mut next = self.cache.get(&*next_key).expect("next item").write();
+
+            mem::swap(&mut next.prev, &mut inner.prev);
+            mem::swap(&mut prev.next, &mut inner.next);
+        }
+    }
+
+    fn remove(&mut self, key: &K) -> Option<K> {
+        if let Some((key, item)) = self.cache.remove_entry(key) {
+            self.remove_inner(item);
+            Some(key)
+        } else {
+            None
+        }
+    }
 }
 
 /// A weighted, thread-safe least-frequently-used cache
@@ -173,55 +233,6 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
         self.state.read().expect("LFU cache state").cache.is_empty()
     }
 
-    /// Return the number of entries in this cache.
-    pub fn len(&self) -> usize {
-        self.state.read().expect("LFU cache state").cache.len()
-    }
-
-    /// Remove an entry from the cache and return `true` if it was present or `false` if not.
-    pub fn remove(&self, key: &K) -> bool {
-        let mut state = self.state.write().expect("LFU cache state");
-
-        if let Some(item) = state.cache.remove(key.borrow()) {
-            let mut inner = item.write();
-
-            if inner.prev.is_none() && inner.next.is_none() {
-                // there was only one item and now the cache is empty
-                state.last = None;
-                state.first = None;
-            } else if inner.prev.is_none() {
-                // the last item has been removed
-                state.last = inner.next.clone();
-
-                let next_key = inner.next.as_ref().expect("next key");
-                let mut next = state.cache.get(&*next_key).expect("next item").write();
-
-                mem::swap(&mut next.prev, &mut inner.prev);
-            } else if inner.next.is_none() {
-                // the first item has been removed
-                state.first = inner.prev.clone();
-                let prev_key = inner.prev.as_ref().expect("previous key");
-                let mut prev = state.cache.get(prev_key).expect("previous item").write();
-
-                mem::swap(&mut prev.next, &mut inner.next);
-            } else {
-                // an item in the middle has been removed
-                let prev_key = inner.prev.as_ref().expect("previous key");
-                let mut prev = state.cache.get(prev_key).expect("previous item").write();
-
-                let next_key = inner.next.as_ref().expect("next key");
-                let mut next = state.cache.get(&*next_key).expect("next item").write();
-
-                mem::swap(&mut next.prev, &mut inner.prev);
-                mem::swap(&mut prev.next, &mut inner.next);
-            }
-
-            true
-        } else {
-            false
-        }
-    }
-
     /// Iterate over the keys in the cache, beginning with the least-frequently used.
     ///
     /// Calling `insert` or `remove` while iterating will result in a deadlock.
@@ -229,6 +240,23 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
         let state = self.state.read().expect("LFU cache");
         let current = state.last.clone();
         Iter { state, current }
+    }
+
+    /// Return the number of entries in this cache.
+    pub fn len(&self) -> usize {
+        self.state.read().expect("LFU cache state").cache.len()
+    }
+
+    /// Remove and return the last element in the cache, if any.
+    pub fn pop(&self) -> Option<K> {
+        let mut state = self.state.write().expect("LFU cache state");
+        state.pop()
+    }
+
+    /// Remove the given `key` from the cache and return it, if it was present.
+    pub fn remove(&self, key: &K) -> Option<K> {
+        let mut state = self.state.write().expect("LFU cache state");
+        state.remove(key)
     }
 }
 
@@ -337,13 +365,9 @@ mod tests {
         let mut cache = LFUCache::new();
 
         let mut rng = thread_rng();
-        for _ in 0..100_000 {
-            let i: i32 = rng.gen_range(0..10);
+        for _ in 1..100_000 {
+            let i: i32 = rng.gen_range(0..1000);
             cache.insert(i);
-            validate(&mut cache);
-
-            let i: i32 = rng.gen_range(0..10);
-            cache.remove(&i);
             validate(&mut cache);
 
             let mut size = 0;
@@ -352,6 +376,24 @@ mod tests {
             }
 
             assert_eq!(cache.len(), size);
+            assert!(!cache.is_empty());
+
+            let i: i32 = rng.gen_range(0..1000);
+            cache.remove(&i);
+            validate(&mut cache);
+
+            let mut size = 0;
+            for _ in cache.iter() {
+                size += 1;
+            }
+
+            while !cache.is_empty() {
+                cache.pop();
+                size -= 1;
+                assert_eq!(cache.len(), size);
+            }
+
+            assert_eq!(cache.len(), 0);
         }
     }
 }

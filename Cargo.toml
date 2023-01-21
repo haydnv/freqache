@@ -1,15 +1,15 @@
 [package]
 name = "freqache"
-version = "0.4.1"
-authors = ["haydn@tinychain.net"]
-edition = "2018"
+version = "0.5.0"
+authors = ["code@tinychain.net"]
+edition = "2021"
 license = "Apache-2.0"
 description = "A thread-safe LFU cache with iterator"
 repository = "https://github.com/haydnv/freqache"
 readme = "README.md"
 
 categories = ["caching", "data-structures"]
-keywords = ["lfu", "cache", "custom", "eviction"]
+keywords = ["least", "frequently", "used", "cache", "eviction"]
 
 [dev-dependencies]
 rand = "0.8"
