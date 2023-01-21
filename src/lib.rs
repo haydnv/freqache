@@ -24,82 +24,128 @@
 //! ```
 
 use std::borrow::Borrow;
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::mem;
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::collections::HashSet;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::{fmt, mem};
 
-struct Inner<K> {
-    prev: Option<K>,
-    next: Option<K>,
+struct ItemState<K> {
+    prev: Option<Arc<K>>,
+    next: Option<Arc<K>>,
 }
 
 struct Item<K> {
-    inner: RwLock<Inner<K>>,
+    key: Arc<K>,
+    state: Arc<RwLock<ItemState<K>>>,
 }
 
 impl<K> Item<K> {
-    fn read(&self) -> RwLockReadGuard<Inner<K>> {
-        self.inner.read().expect("item")
+    fn read(&self) -> RwLockReadGuard<ItemState<K>> {
+        self.state.read().expect("item")
     }
 
-    fn write(&self) -> RwLockWriteGuard<Inner<K>> {
-        self.inner.write().expect("item")
+    fn write(&self) -> RwLockWriteGuard<ItemState<K>> {
+        self.state.write().expect("item")
     }
 }
 
-pub struct State<K> {
-    cache: HashMap<K, Item<K>>,
-    first: Option<K>,
-    last: Option<K>,
+impl<K> Clone for Item<K> {
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.clone(),
+            state: self.state.clone(),
+        }
+    }
 }
 
-impl<K: Clone + Eq + Hash> State<K> {
-    fn bump(&mut self, key: K) {
-        let mut item = if let Some(item) = self.cache.get(&key) {
-            item.write()
-        } else {
-            return;
-        };
+impl<K: PartialEq> PartialEq<K> for Item<K> {
+    fn eq(&self, other: &K) -> bool {
+        self.key.deref() == other
+    }
+}
 
-        let last = if item.next.is_none() {
+impl<K: PartialEq> PartialEq<Arc<K>> for Item<K> {
+    fn eq(&self, other: &Arc<K>) -> bool {
+        &self.key == other
+    }
+}
+
+impl<K: PartialEq> PartialEq<Item<K>> for Item<K> {
+    fn eq(&self, other: &Item<K>) -> bool {
+        self.key == other.key
+    }
+}
+
+impl<K: PartialEq> Eq for Item<K> {}
+
+impl<K> Borrow<K> for Item<K> {
+    fn borrow(&self) -> &K {
+        self.key.deref()
+    }
+}
+
+impl<K> Borrow<Arc<K>> for Item<K> {
+    fn borrow(&self) -> &Arc<K> {
+        &self.key
+    }
+}
+
+impl<K: Hash> Hash for Item<K> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key.hash(state)
+    }
+}
+
+struct CacheState<K> {
+    cache: HashSet<Item<K>>,
+    first: Option<Arc<K>>,
+    last: Option<Arc<K>>,
+}
+
+impl<K: Eq + Hash> CacheState<K> {
+    fn bump(&mut self, item: Item<K>) {
+        let mut item_state = item.write();
+
+        let last = if item_state.next.is_none() {
             // can't bump the first item
             return;
-        } else if item.prev.is_none() && item.next.is_some() {
+        } else if item_state.prev.is_none() && item_state.next.is_some() {
             // bump the last item
 
-            let next_key = item.next.as_ref().expect("next key");
+            let next_key = item_state.next.as_ref().expect("next key");
             let mut next = self.cache.get(next_key).expect("next item").write();
 
-            mem::swap(&mut next.prev, &mut item.prev); // set next.prev
-            mem::swap(&mut item.next, &mut next.next); // set item.next
-            mem::swap(&mut item.prev, &mut next.next); // set item.prev & next.next
+            mem::swap(&mut next.prev, &mut item_state.prev); // set next.prev
+            mem::swap(&mut item_state.next, &mut next.next); // set item.next
+            mem::swap(&mut item_state.prev, &mut next.next); // set item.prev & next.next
 
-            item.prev.clone()
+            item_state.prev.clone()
         } else {
             // bump an item in the middle
 
-            let prev_key = item.prev.as_ref().expect("previous key");
+            let prev_key = item_state.prev.as_ref().expect("previous key");
             let mut prev = self.cache.get(prev_key).expect("previous item").write();
 
-            let next_key = item.next.as_ref().expect("next key").clone();
+            let next_key = item_state.next.as_ref().expect("next key").clone();
             let mut next = self.cache.get(&next_key).expect("next item").write();
 
-            mem::swap(&mut prev.next, &mut item.next); // set prev.next
-            mem::swap(&mut item.next, &mut next.next); // set item.next
-            mem::swap(&mut next.prev, &mut item.prev); // set next.prev
+            mem::swap(&mut prev.next, &mut item_state.next); // set prev.next
+            mem::swap(&mut item_state.next, &mut next.next); // set item.next
+            mem::swap(&mut next.prev, &mut item_state.prev); // set next.prev
 
-            item.prev = Some(next_key); // set item.prev
+            item_state.prev = Some(next_key); // set item.prev
 
             None
         };
 
-        let first = if let Some(next_key) = &item.next {
+        let first = if let Some(next_key) = &item_state.next {
             let mut skip = self.cache.get(next_key).expect("skipped item").write();
-            skip.prev = Some(key);
+
+            skip.prev = Some(item.key.clone());
             None
         } else {
-            Some(key)
+            Some(item.key.clone())
         };
 
         match (last, first) {
@@ -113,15 +159,36 @@ impl<K: Clone + Eq + Hash> State<K> {
         }
     }
 
-    fn pop(&mut self) -> Option<K> {
-        let last = self.last.as_ref()?;
+    fn insert(&mut self, key: K) {
+        let key = Arc::new(key);
+        let prev = None;
+        let mut next = Some(key.clone());
+        mem::swap(&mut self.last, &mut next);
 
-        let (key, item) = self.cache.remove_entry(last).expect("last entry");
-        self.remove_inner(item);
-        Some(key)
+        if let Some(next_key) = &next {
+            let mut next = self.cache.get(next_key).expect("next item").write();
+            next.prev = Some(key.clone());
+        }
+
+        if self.first.is_none() {
+            self.first = Some(key.clone());
+        }
+
+        let item = Item {
+            key: key.clone(),
+            state: Arc::new(RwLock::new(ItemState { prev, next })),
+        };
+
+        debug_assert!(self.cache.insert(item));
     }
 
-    fn remove_inner(&mut self, item: Item<K>) {
+    fn pop(&mut self) -> Option<Arc<K>> {
+        let last = self.last.as_ref()?;
+        let item = self.cache.take(last).expect("last entry");
+        Some(self.remove_inner(item))
+    }
+
+    fn remove_inner(&mut self, item: Item<K>) -> Arc<K> {
         let mut inner = item.write();
 
         if inner.prev.is_none() && inner.next.is_none() {
@@ -154,12 +221,14 @@ impl<K: Clone + Eq + Hash> State<K> {
             mem::swap(&mut next.prev, &mut inner.prev);
             mem::swap(&mut prev.next, &mut inner.next);
         }
+
+        mem::drop(inner);
+        item.key
     }
 
-    fn remove(&mut self, key: &K) -> Option<K> {
-        if let Some((key, item)) = self.cache.remove_entry(key) {
-            self.remove_inner(item);
-            Some(key)
+    fn remove(&mut self, key: &K) -> Option<Arc<K>> {
+        if let Some(item) = self.cache.take(key) {
+            Some(self.remove_inner(item))
         } else {
             None
         }
@@ -168,14 +237,14 @@ impl<K: Clone + Eq + Hash> State<K> {
 
 /// A weighted, thread-safe least-frequently-used cache
 pub struct LFUCache<K> {
-    state: RwLock<State<K>>,
+    state: RwLock<CacheState<K>>,
 }
 
-impl<K: Clone + Eq + Hash> LFUCache<K> {
+impl<K: Eq + Hash> LFUCache<K> {
     /// Construct a new `LFUCache`.
     pub fn new() -> Self {
-        let state = State {
-            cache: HashMap::new(),
+        let state = CacheState {
+            cache: HashSet::new(),
             first: None,
             last: None,
         };
@@ -186,13 +255,20 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
     }
 
     /// Return `true` if the cache contains the given key.
-    pub fn contains_key<Q: ?Sized>(&self, key: &Q) -> bool
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
+    pub fn contains(&self, key: &K) -> bool {
         let state = self.state.read().expect("LFU read lock");
-        state.cache.contains_key(key)
+        state.cache.contains(key)
+    }
+
+    /// Increase the given `key`'s priority and return `true` if present, otherwise `false`.
+    pub fn bump<Q>(&self, key: &K) -> bool {
+        let mut state = self.state.write().expect("LFU read lock");
+        if let Some(key) = state.cache.get(key).cloned() {
+            state.bump(key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Add a new key to the cache and return `true` is it was already present, otherwise `false`.
@@ -201,31 +277,13 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
     pub fn insert(&self, key: K) -> bool {
         let mut state = self.state.write().expect("LFU write lock");
 
-        if state.cache.contains_key(&key) {
-            state.bump(key);
-            true
-        } else {
-            let prev = None;
-            let mut next = Some(key.clone());
-            mem::swap(&mut state.last, &mut next);
-
-            if let Some(next_key) = &next {
-                let mut next = state.cache.get(next_key).expect("next item").write();
-
-                next.prev = Some(key.clone());
-            }
-
-            if state.first.is_none() {
-                state.first = Some(key.clone());
-            }
-
-            let item = Item {
-                inner: RwLock::new(Inner { prev, next }),
-            };
-            state.cache.insert(key, item);
-
-            false
+        if let Some(item) = state.cache.get(&key).cloned() {
+            state.bump(item);
+            return true;
         }
+
+        state.insert(key);
+        false
     }
 
     /// Return `true` if the cache is empty.
@@ -246,27 +304,33 @@ impl<K: Clone + Eq + Hash> LFUCache<K> {
     pub fn len(&self) -> usize {
         self.state.read().expect("LFU cache state").cache.len()
     }
+}
 
+impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
     /// Remove and return the last element in the cache, if any.
     pub fn pop(&self) -> Option<K> {
         let mut state = self.state.write().expect("LFU cache state");
-        state.pop()
+        let key = state.pop()?;
+        let key = Arc::try_unwrap(key).expect("key");
+        Some(key)
     }
 
     /// Remove the given `key` from the cache and return it, if it was present.
     pub fn remove(&self, key: &K) -> Option<K> {
         let mut state = self.state.write().expect("LFU cache state");
-        state.remove(key)
+        let key = state.remove(key)?;
+        let key = Arc::try_unwrap(key).expect("key");
+        Some(key)
     }
 }
 
 pub struct Iter<'a, K> {
-    state: RwLockReadGuard<'a, State<K>>,
-    current: Option<K>,
+    state: RwLockReadGuard<'a, CacheState<K>>,
+    current: Option<Arc<K>>,
 }
 
-impl<'a, K: Clone + Eq + Hash> Iterator for Iter<'a, K> {
-    type Item = K;
+impl<'a, K: Eq + Hash> Iterator for Iter<'a, K> {
+    type Item = Arc<K>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(key) = &mut self.current {
@@ -289,7 +353,7 @@ mod tests {
     use super::*;
 
     #[allow(dead_code)]
-    fn print_debug<K: fmt::Display + Clone + Eq + Hash>(cache: &LFUCache<K>) {
+    fn print_debug<K: fmt::Display + Eq + Hash>(cache: &LFUCache<K>) {
         let state = cache.state.read().expect("LFU cache state");
 
         let mut next = state.last.clone();
@@ -311,7 +375,7 @@ mod tests {
         println!();
     }
 
-    fn validate<K: fmt::Debug + Clone + Eq + Hash>(cache: &LFUCache<K>) {
+    fn validate<K: fmt::Debug + Eq + Hash>(cache: &LFUCache<K>) {
         let state = cache.state.read().expect("LFU cache state");
 
         if state.cache.is_empty() {
@@ -349,15 +413,16 @@ mod tests {
         let expected: Vec<i32> = (0..10).collect();
 
         for i in expected.iter().rev() {
-            cache.insert(i);
+            cache.insert(*i);
         }
 
         let mut actual = Vec::with_capacity(expected.len());
         for i in cache.iter() {
-            actual.push(*i);
+            actual.push(i);
         }
 
-        assert_eq!(actual, expected)
+        assert_eq!(actual.len(), expected.len());
+        assert!(actual.iter().zip(expected).all(|(l, r)| **l == r))
     }
 
     #[test]
