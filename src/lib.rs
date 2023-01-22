@@ -289,8 +289,7 @@ impl<K: Eq + Hash> LFUCache<K> {
     /// Calling `insert` or `remove` while iterating will result in a deadlock.
     pub fn iter(&self) -> Iter<K> {
         let state = self.state.read().expect("LFU cache");
-        let current = state.last.clone();
-        Iter { state, current }
+        Iter::new(state)
     }
 
     /// Return the number of entries in this cache.
@@ -322,12 +321,19 @@ pub struct Iter<'a, K> {
     current: Option<Arc<K>>,
 }
 
+impl<'a, K: Eq + Hash> Iter<'a, K> {
+    fn new(state: RwLockReadGuard<'a, CacheState<K>>) -> Self {
+        let current = state.last.clone();
+        Self { state, current }
+    }
+}
+
 impl<'a, K: Eq + Hash> Iterator for Iter<'a, K> {
     type Item = Arc<K>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(key) = &mut self.current {
-            let item = self.state.cache.get::<K>(key).expect("LFU cache item");
+        if let Some(current) = self.current.as_ref() {
+            let item = self.state.cache.get::<K>(current).expect("next item");
             let mut next = item.read().next.clone();
             mem::swap(&mut self.current, &mut next);
             next
