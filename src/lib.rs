@@ -1,4 +1,4 @@
-//! A thread-safe set which provides an `Iterator` ordered by access frequency.
+//! A hash map ordered by access frequency.
 //!
 //! Example:
 //! ```
@@ -7,14 +7,12 @@
 //! const CACHE_SIZE: usize = 10;
 //!
 //! let mut cache = LFUCache::new();
-//! cache.insert("key1");
-//! cache.insert("key2");
-//! cache.insert("key3");
-//! cache.insert("key2");
+//! cache.insert("one", 1);
+//! cache.insert("two", 2);
 //! // ...
 //!
-//! for key in cache.iter() {
-//!     println!("key: {}", key);
+//! for (key, value) in cache.iter() {
+//!     println!("{}: {}", key, value);
 //! }
 //!
 //! while cache.len() > CACHE_SIZE {
@@ -25,20 +23,21 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::mem;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::{fmt, mem};
 
 struct ItemState<K> {
     prev: Option<Arc<K>>,
     next: Option<Arc<K>>,
 }
 
-struct Item<K> {
+struct Item<K, V> {
     key: Arc<K>,
+    value: V,
     state: Arc<RwLock<ItemState<K>>>,
 }
 
-impl<K> Item<K> {
+impl<K, V> Item<K, V> {
     fn read(&self) -> RwLockReadGuard<ItemState<K>> {
         self.state.read().expect("item")
     }
@@ -49,13 +48,13 @@ impl<K> Item<K> {
 }
 
 /// A hash set whose keys are ordered by frequency of access
-pub struct LFUCache<K> {
-    cache: HashMap<Arc<K>, Item<K>>,
+pub struct LFUCache<K, V> {
+    cache: HashMap<Arc<K>, Item<K, V>>,
     first: Option<Arc<K>>,
     last: Option<Arc<K>>,
 }
 
-impl<K: Eq + Hash> LFUCache<K> {
+impl<K: Eq + Hash, V> LFUCache<K, V> {
     /// Construct a new `LFUCache`.
     pub fn new() -> Self {
         Self {
@@ -138,36 +137,33 @@ impl<K: Eq + Hash> LFUCache<K> {
         true
     }
 
-    /// Add a new key to the cache and return `false` is it was already present, otherwise `true`.
-    ///
-    /// If already present, the key's priority is increased by one.
-    pub fn insert(&mut self, key: K) -> bool {
-        if self.bump(&key) {
-            true
-        } else {
-            let key = Arc::new(key);
-            let prev = None;
-            let mut next = Some(key.clone());
-            mem::swap(&mut self.last, &mut next);
+    /// Add a new value to the cache, and return the old value at `key`, if any.
+    pub fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let old_value = self.remove(&key);
 
-            if let Some(next_key) = &next {
-                let mut next = self.cache.get::<K>(next_key).expect("next item").write();
-                next.prev = Some(key.clone());
-            }
+        let key = Arc::new(key);
+        let prev = None;
+        let mut next = Some(key.clone());
+        mem::swap(&mut self.last, &mut next);
 
-            if self.first.is_none() {
-                self.first = Some(key.clone());
-            }
-
-            let item = Item {
-                key: key.clone(),
-                state: Arc::new(RwLock::new(ItemState { prev, next })),
-            };
-
-            assert!(self.cache.insert(key, item).is_none());
-
-            false
+        if let Some(next_key) = &next {
+            let mut next = self.cache.get::<K>(next_key).expect("next item").write();
+            next.prev = Some(key.clone());
         }
+
+        if self.first.is_none() {
+            self.first = Some(key.clone());
+        }
+
+        let item = Item {
+            key: key.clone(),
+            value,
+            state: Arc::new(RwLock::new(ItemState { prev, next })),
+        };
+
+        assert!(self.cache.insert(key, item).is_none());
+
+        old_value
     }
 
     /// Return `true` if the cache is empty.
@@ -176,18 +172,26 @@ impl<K: Eq + Hash> LFUCache<K> {
     }
 
     /// Iterate over the keys in the cache, beginning with the least-frequently used.
-    pub fn iter(&self) -> Iter<K> {
-        Iter::new(&self.cache, self.last.clone())
+    pub fn iter(&self) -> Iter<K, V> {
+        let next = if let Some(key) = &self.last {
+            let item = self.cache.get(key).expect("last item");
+            Some((key, item))
+        } else {
+            None
+        };
+
+        Iter {
+            cache: &self.cache,
+            next,
+        }
     }
 
     /// Return the number of entries in this cache.
     pub fn len(&self) -> usize {
         self.cache.len()
     }
-}
 
-impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
-    fn remove_inner(&mut self, item: Item<K>) -> Arc<K> {
+    fn remove_inner(&mut self, item: Item<K, V>) -> V {
         let mut item_state = item.write();
 
         if item_state.prev.is_none() && item_state.next.is_none() {
@@ -230,47 +234,43 @@ impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
         }
 
         mem::drop(item_state);
-        item.key
+        item.value
     }
 
     /// Remove and return the last element in the cache, if any.
-    pub fn pop(&mut self) -> Option<K> {
+    pub fn pop(&mut self) -> Option<V> {
         let last = self.last.as_ref()?;
         let item = self.cache.remove(last).expect("last entry");
-        let key = self.remove_inner(item);
-        let key = Arc::try_unwrap(key).expect("key");
-        Some(key)
+        Some(self.remove_inner(item))
     }
 
     /// Remove the given `key` from the cache and return it, if it was present.
-    pub fn remove(&mut self, key: &K) -> Option<K> {
+    pub fn remove(&mut self, key: &K) -> Option<V> {
         let item = self.cache.remove(key)?;
-        let key = self.remove_inner(item);
-        let key = Arc::try_unwrap(key).expect("key");
-        Some(key)
+        Some(self.remove_inner(item))
     }
 }
 
-pub struct Iter<'a, K> {
-    cache: &'a HashMap<Arc<K>, Item<K>>,
-    current: Option<Arc<K>>,
+pub struct Iter<'a, K, V> {
+    cache: &'a HashMap<Arc<K>, Item<K, V>>,
+    next: Option<(&'a Arc<K>, &'a Item<K, V>)>,
 }
 
-impl<'a, K: Eq + Hash> Iter<'a, K> {
-    fn new(cache: &'a HashMap<Arc<K>, Item<K>>, current: Option<Arc<K>>) -> Self {
-        Self { cache, current }
-    }
-}
-
-impl<'a, K: Eq + Hash> Iterator for Iter<'a, K> {
-    type Item = Arc<K>;
+impl<'a, K: Eq + Hash, V> Iterator for Iter<'a, K, V> {
+    type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(current) = self.current.as_ref() {
-            let item = self.cache.get::<K>(current).expect("next item");
-            let mut next = item.read().next.clone();
-            mem::swap(&mut self.current, &mut next);
-            next
+        let (_key, item) = self.next?;
+        let mut next = if let Some(next_key) = &item.read().next {
+            self.cache.get_key_value(next_key)
+        } else {
+            None
+        };
+
+        mem::swap(&mut self.next, &mut next);
+
+        if let Some((key, item)) = next {
+            Some((&**key, &item.value))
         } else {
             None
         }
@@ -286,7 +286,7 @@ mod tests {
     use super::*;
 
     #[allow(dead_code)]
-    fn print_debug<K: fmt::Display + Eq + Hash>(cache: &LFUCache<K>) {
+    fn print_debug<K: fmt::Display + Eq + Hash, V>(cache: &LFUCache<K, V>) {
         let mut next = cache.last.clone();
         while let Some(next_key) = next {
             let item = cache.cache.get::<K>(&next_key).expect("item").read();
@@ -306,7 +306,7 @@ mod tests {
         println!();
     }
 
-    fn validate<K: fmt::Debug + Eq + Hash>(cache: &LFUCache<K>) {
+    fn validate<K: fmt::Debug + Eq + Hash, V>(cache: &LFUCache<K, V>) {
         if cache.cache.is_empty() {
             assert!(cache.first.is_none(), "first item is {:?}", cache.first);
             assert!(cache.last.is_none(), "last item is {:?}", cache.last);
@@ -342,12 +342,13 @@ mod tests {
         let expected: Vec<i32> = (0..10).collect();
 
         for i in expected.iter().rev() {
-            cache.insert(*i);
+            cache.insert(*i, i.to_string());
             validate(&cache);
         }
 
         let mut actual = Vec::with_capacity(expected.len());
-        for i in cache.iter() {
+        for (i, s) in cache.iter() {
+            assert_eq!(&i.to_string(), s);
             actual.push(i);
         }
 
@@ -363,7 +364,7 @@ mod tests {
         let mut rng = thread_rng();
         for _ in 1..100_000 {
             let i: i32 = rng.gen_range(0..1000);
-            cache.insert(i);
+            cache.insert(i, i.to_string());
             validate(&mut cache);
 
             let mut size = 0;
