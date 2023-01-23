@@ -21,10 +21,11 @@
 //!
 //! ```
 
+use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::mem;
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 
 struct ItemState<K> {
     prev: Option<Arc<K>>,
@@ -34,16 +35,13 @@ struct ItemState<K> {
 struct Item<K, V> {
     key: Arc<K>,
     value: V,
-    state: Arc<RwLock<ItemState<K>>>,
+    state: RefCell<ItemState<K>>,
 }
 
 impl<K, V> Item<K, V> {
-    fn read(&self) -> RwLockReadGuard<ItemState<K>> {
-        self.state.read().expect("item")
-    }
-
-    fn write(&self) -> RwLockWriteGuard<ItemState<K>> {
-        self.state.write().expect("item")
+    #[inline]
+    fn state(&self) -> RefMut<ItemState<K>> {
+        self.state.borrow_mut()
     }
 }
 
@@ -77,7 +75,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
             return false;
         };
 
-        let mut item_state = item.write();
+        let mut item_state = item.state();
 
         let last = if item_state.next.is_none() {
             // can't bump the first item
@@ -86,7 +84,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
             // bump the last item
 
             let next_key = item_state.next.as_ref().expect("next key");
-            let mut next = self.cache.get::<K>(next_key).expect("next item").write();
+            let mut next = self.cache.get::<K>(next_key).expect("next item").state();
 
             mem::swap(&mut next.prev, &mut item_state.prev); // set next.prev
             mem::swap(&mut item_state.next, &mut next.next); // set item.next
@@ -101,10 +99,10 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
                 .cache
                 .get::<K>(prev_key)
                 .expect("previous item")
-                .write();
+                .state();
 
             let next_key = item_state.next.as_ref().expect("next key").clone();
-            let mut next = self.cache.get::<K>(&next_key).expect("next item").write();
+            let mut next = self.cache.get::<K>(&next_key).expect("next item").state();
 
             mem::swap(&mut prev.next, &mut item_state.next); // set prev.next
             mem::swap(&mut item_state.next, &mut next.next); // set item.next
@@ -116,8 +114,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
         };
 
         let first = if let Some(next_key) = &item_state.next {
-            let mut skip = self.cache.get::<K>(next_key).expect("skipped item").write();
-
+            let mut skip = self.cache.get::<K>(next_key).expect("skipped item").state();
             skip.prev = Some(item.key.clone());
             None
         } else {
@@ -147,7 +144,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
         mem::swap(&mut self.last, &mut next);
 
         if let Some(next_key) = &next {
-            let mut next = self.cache.get::<K>(next_key).expect("next item").write();
+            let mut next = self.cache.get::<K>(next_key).expect("next item").state();
             next.prev = Some(key.clone());
         }
 
@@ -158,7 +155,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
         let item = Item {
             key: key.clone(),
             value,
-            state: Arc::new(RwLock::new(ItemState { prev, next })),
+            state: RefCell::new(ItemState { prev, next }),
         };
 
         assert!(self.cache.insert(key, item).is_none());
@@ -192,7 +189,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
     }
 
     fn remove_inner(&mut self, item: Item<K, V>) -> V {
-        let mut item_state = item.write();
+        let mut item_state = item.state();
 
         if item_state.prev.is_none() && item_state.next.is_none() {
             // there was only one item and now the cache is empty
@@ -203,7 +200,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
             self.last = item_state.next.clone();
 
             let next_key = item_state.next.as_ref().expect("next key");
-            let mut next = self.cache.get::<K>(next_key).expect("next item").write();
+            let mut next = self.cache.get::<K>(next_key).expect("next item").state();
 
             mem::swap(&mut next.prev, &mut item_state.prev);
         } else if item_state.next.is_none() {
@@ -214,7 +211,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
                 .cache
                 .get::<K>(prev_key)
                 .expect("previous item")
-                .write();
+                .state();
 
             mem::swap(&mut prev.next, &mut item_state.next);
         } else {
@@ -224,16 +221,16 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
                 .cache
                 .get::<K>(prev_key)
                 .expect("previous item")
-                .write();
+                .state();
 
             let next_key = item_state.next.as_ref().expect("next key");
-            let mut next = self.cache.get::<K>(next_key).expect("next item").write();
+            let mut next = self.cache.get::<K>(next_key).expect("next item").state();
 
             mem::swap(&mut next.prev, &mut item_state.prev);
             mem::swap(&mut prev.next, &mut item_state.next);
         }
 
-        mem::drop(item_state);
+        std::mem::drop(item_state);
         item.value
     }
 
@@ -261,7 +258,7 @@ impl<'a, K: Eq + Hash, V> Iterator for Iter<'a, K, V> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let (_key, item) = self.next?;
-        let mut next = if let Some(next_key) = &item.read().next {
+        let mut next = if let Some(next_key) = &item.state().next {
             self.cache.get_key_value(next_key)
         } else {
             None
@@ -289,7 +286,7 @@ mod tests {
     fn print_debug<K: fmt::Display + Eq + Hash, V>(cache: &LFUCache<K, V>) {
         let mut next = cache.last.clone();
         while let Some(next_key) = next {
-            let item = cache.cache.get::<K>(&next_key).expect("item").read();
+            let item = cache.cache.get::<K>(&next_key).expect("item").state();
 
             if let Some(prev_key) = item.prev.as_ref() {
                 print!("{}-", prev_key);
@@ -312,27 +309,28 @@ mod tests {
             assert!(cache.last.is_none(), "last item is {:?}", cache.last);
         } else {
             let first_key = cache.first.as_ref().expect("first key");
-            let first = cache.cache.get::<K>(first_key).expect("first item").read();
+            let first = cache.cache.get::<K>(first_key).expect("first item");
 
-            assert!(first.next.is_none());
+            assert!(first.state.borrow().next.is_none());
 
             let last_key = cache.last.as_ref().expect("last key");
-            let last = cache.cache.get::<K>(last_key).expect("last item").read();
-            assert!(last.prev.is_none());
+            let last = cache.cache.get::<K>(last_key).expect("last item");
+            assert!(last.state.borrow().prev.is_none());
         }
 
         let mut last = None;
         let mut next = cache.last.clone();
         while let Some(key) = next {
-            let item = cache.cache.get::<K>(&key).expect("item").read();
+            let item = cache.cache.get::<K>(&key).expect("item");
 
             if let Some(last_key) = &last {
-                let prev_key = item.prev.as_ref().expect("previous key");
+                let item_state = item.state.borrow();
+                let prev_key = item_state.prev.as_ref().expect("previous key");
                 assert_eq!(last_key, prev_key);
             }
 
             last = Some(key);
-            next = item.next.clone();
+            next = item.state.borrow().next.clone();
         }
     }
 
