@@ -76,14 +76,30 @@ impl<K: Hash> Hash for Item<K> {
     }
 }
 
-struct CacheState<K> {
+/// A hash set whose keys are ordered by frequency of access
+pub struct LFUCache<K> {
     cache: HashSet<Item<K>>,
     first: Option<Arc<K>>,
     last: Option<Arc<K>>,
 }
 
-impl<K: Eq + Hash> CacheState<K> {
-    fn bump(&mut self, key: &K) -> bool {
+impl<K: Eq + Hash> LFUCache<K> {
+    /// Construct a new `LFUCache`.
+    pub fn new() -> Self {
+        Self {
+            cache: HashSet::new(),
+            first: None,
+            last: None,
+        }
+    }
+
+    /// Return `true` if the cache contains the given key.
+    pub fn contains(&self, key: &K) -> bool {
+        self.cache.contains(key)
+    }
+
+    /// Increase the given `key`'s priority and return `true` if present, otherwise `false`.
+    pub fn bump(&mut self, key: &K) -> bool {
         let item = if let Some(item) = self.cache.get(key) {
             item
         } else {
@@ -150,35 +166,55 @@ impl<K: Eq + Hash> CacheState<K> {
         true
     }
 
-    fn insert(&mut self, key: K) {
-        let key = Arc::new(key);
-        let prev = None;
-        let mut next = Some(key.clone());
-        mem::swap(&mut self.last, &mut next);
+    /// Add a new key to the cache and return `false` is it was already present, otherwise `true`.
+    ///
+    /// If already present, the key's priority is increased by one.
+    pub fn insert(&mut self, key: K) -> bool {
+        if self.bump(&key) {
+            true
+        } else {
+            let key = Arc::new(key);
+            let prev = None;
+            let mut next = Some(key.clone());
+            mem::swap(&mut self.last, &mut next);
 
-        if let Some(next_key) = &next {
-            let mut next = self.cache.get::<K>(next_key).expect("next item").write();
-            next.prev = Some(key.clone());
+            if let Some(next_key) = &next {
+                let mut next = self.cache.get::<K>(next_key).expect("next item").write();
+                next.prev = Some(key.clone());
+            }
+
+            if self.first.is_none() {
+                self.first = Some(key.clone());
+            }
+
+            let item = Item {
+                key: key.clone(),
+                state: Arc::new(RwLock::new(ItemState { prev, next })),
+            };
+
+            assert!(self.cache.insert(item));
+
+            false
         }
-
-        if self.first.is_none() {
-            self.first = Some(key.clone());
-        }
-
-        let item = Item {
-            key: key.clone(),
-            state: Arc::new(RwLock::new(ItemState { prev, next })),
-        };
-
-        assert!(self.cache.insert(item));
     }
 
-    fn pop(&mut self) -> Option<Arc<K>> {
-        let last = self.last.as_ref()?;
-        let item = self.cache.take::<K>(last).expect("last entry");
-        Some(self.remove_inner(item))
+    /// Return `true` if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
     }
 
+    /// Iterate over the keys in the cache, beginning with the least-frequently used.
+    pub fn iter(&self) -> Iter<K> {
+        Iter::new(&self.cache, self.last.clone())
+    }
+
+    /// Return the number of entries in this cache.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+}
+
+impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
     fn remove_inner(&mut self, item: Item<K>) -> Arc<K> {
         let mut item_state = item.write();
 
@@ -225,106 +261,32 @@ impl<K: Eq + Hash> CacheState<K> {
         item.key
     }
 
-    fn remove(&mut self, key: &K) -> Option<Arc<K>> {
-        if let Some(item) = self.cache.take(key) {
-            Some(self.remove_inner(item))
-        } else {
-            None
-        }
-    }
-}
-
-/// A weighted, thread-safe least-frequently-used cache
-pub struct LFUCache<K> {
-    state: RwLock<CacheState<K>>,
-}
-
-impl<K: Eq + Hash> LFUCache<K> {
-    /// Construct a new `LFUCache`.
-    pub fn new() -> Self {
-        let state = CacheState {
-            cache: HashSet::new(),
-            first: None,
-            last: None,
-        };
-
-        Self {
-            state: RwLock::new(state),
-        }
-    }
-
-    /// Return `true` if the cache contains the given key.
-    pub fn contains(&self, key: &K) -> bool {
-        let state = self.state.read().expect("LFU read lock");
-        state.cache.contains(key)
-    }
-
-    /// Increase the given `key`'s priority and return `true` if present, otherwise `false`.
-    pub fn bump<Q>(&self, key: &K) -> bool {
-        let mut state = self.state.write().expect("LFU read lock");
-        state.bump(key)
-    }
-
-    /// Add a new key to the cache and return `true` is it was already present, otherwise `false`.
-    ///
-    /// If already present, the key's priority is increased by one.
-    pub fn insert(&self, key: K) -> bool {
-        let mut state = self.state.write().expect("LFU write lock");
-
-        if state.bump(&key) {
-            true
-        } else {
-            state.insert(key);
-            false
-        }
-    }
-
-    /// Return `true` if the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.state.read().expect("LFU cache state").cache.is_empty()
-    }
-
-    /// Iterate over the keys in the cache, beginning with the least-frequently used.
-    ///
-    /// Calling `insert` or `remove` while iterating will result in a deadlock.
-    pub fn iter(&self) -> Iter<K> {
-        let state = self.state.read().expect("LFU cache");
-        Iter::new(state)
-    }
-
-    /// Return the number of entries in this cache.
-    pub fn len(&self) -> usize {
-        self.state.read().expect("LFU cache state").cache.len()
-    }
-}
-
-impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
     /// Remove and return the last element in the cache, if any.
-    pub fn pop(&self) -> Option<K> {
-        let mut state = self.state.write().expect("LFU cache state");
-        let key = state.pop()?;
+    pub fn pop(&mut self) -> Option<K> {
+        let last = self.last.as_ref()?;
+        let item = self.cache.take::<K>(last).expect("last entry");
+        let key = self.remove_inner(item);
         let key = Arc::try_unwrap(key).expect("key");
         Some(key)
     }
 
     /// Remove the given `key` from the cache and return it, if it was present.
-    pub fn remove(&self, key: &K) -> Option<K> {
-        let mut state = self.state.write().expect("LFU cache state");
-        let key = state.remove(key)?;
+    pub fn remove(&mut self, key: &K) -> Option<K> {
+        let item = self.cache.take(key)?;
+        let key = self.remove_inner(item);
         let key = Arc::try_unwrap(key).expect("key");
         Some(key)
     }
 }
 
 pub struct Iter<'a, K> {
-    state: RwLockReadGuard<'a, CacheState<K>>,
+    cache: &'a HashSet<Item<K>>,
     current: Option<Arc<K>>,
 }
 
 impl<'a, K: Eq + Hash> Iter<'a, K> {
-    fn new(state: RwLockReadGuard<'a, CacheState<K>>) -> Self {
-        let current = state.last.clone();
-        Self { state, current }
+    fn new(cache: &'a HashSet<Item<K>>, current: Option<Arc<K>>) -> Self {
+        Self { cache, current }
     }
 }
 
@@ -333,7 +295,7 @@ impl<'a, K: Eq + Hash> Iterator for Iter<'a, K> {
 
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(current) = self.current.as_ref() {
-            let item = self.state.cache.get::<K>(current).expect("next item");
+            let item = self.cache.get::<K>(current).expect("next item");
             let mut next = item.read().next.clone();
             mem::swap(&mut self.current, &mut next);
             next
@@ -353,11 +315,9 @@ mod tests {
 
     #[allow(dead_code)]
     fn print_debug<K: fmt::Display + Eq + Hash>(cache: &LFUCache<K>) {
-        let state = cache.state.read().expect("LFU cache state");
-
-        let mut next = state.last.clone();
+        let mut next = cache.last.clone();
         while let Some(next_key) = next {
-            let item = state.cache.get::<K>(&next_key).expect("item").read();
+            let item = cache.cache.get::<K>(&next_key).expect("item").read();
 
             if let Some(prev_key) = item.prev.as_ref() {
                 print!("{}-", prev_key);
@@ -375,26 +335,24 @@ mod tests {
     }
 
     fn validate<K: fmt::Debug + Eq + Hash>(cache: &LFUCache<K>) {
-        let state = cache.state.read().expect("LFU cache state");
-
-        if state.cache.is_empty() {
-            assert!(state.first.is_none(), "first item is {:?}", state.first);
-            assert!(state.last.is_none(), "last item is {:?}", state.last);
+        if cache.cache.is_empty() {
+            assert!(cache.first.is_none(), "first item is {:?}", cache.first);
+            assert!(cache.last.is_none(), "last item is {:?}", cache.last);
         } else {
-            let first_key = state.first.as_ref().expect("first key");
-            let first = state.cache.get::<K>(first_key).expect("first item").read();
+            let first_key = cache.first.as_ref().expect("first key");
+            let first = cache.cache.get::<K>(first_key).expect("first item").read();
 
             assert!(first.next.is_none());
 
-            let last_key = state.last.as_ref().expect("last key");
-            let last = state.cache.get::<K>(last_key).expect("last item").read();
+            let last_key = cache.last.as_ref().expect("last key");
+            let last = cache.cache.get::<K>(last_key).expect("last item").read();
             assert!(last.prev.is_none());
         }
 
         let mut last = None;
-        let mut next = state.last.clone();
+        let mut next = cache.last.clone();
         while let Some(key) = next {
-            let item = state.cache.get::<K>(&key).expect("item").read();
+            let item = cache.cache.get::<K>(&key).expect("item").read();
 
             if let Some(last_key) = &last {
                 let prev_key = item.prev.as_ref().expect("previous key");
@@ -408,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_order() {
-        let cache = LFUCache::new();
+        let mut cache = LFUCache::new();
         let expected: Vec<i32> = (0..10).collect();
 
         for i in expected.iter().rev() {
