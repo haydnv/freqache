@@ -23,10 +23,8 @@
 //!
 //! ```
 
-use std::borrow::Borrow;
-use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
-use std::ops::Deref;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::{fmt, mem};
 
@@ -50,35 +48,9 @@ impl<K> Item<K> {
     }
 }
 
-impl<K: PartialEq> PartialEq<K> for Item<K> {
-    fn eq(&self, other: &K) -> bool {
-        self.key.deref() == other
-    }
-}
-
-impl<K: PartialEq> PartialEq<Item<K>> for Item<K> {
-    fn eq(&self, other: &Item<K>) -> bool {
-        self.key == other.key
-    }
-}
-
-impl<K: PartialEq> Eq for Item<K> {}
-
-impl<K> Borrow<K> for Item<K> {
-    fn borrow(&self) -> &K {
-        self.key.deref()
-    }
-}
-
-impl<K: Hash> Hash for Item<K> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.key.hash(state)
-    }
-}
-
 /// A hash set whose keys are ordered by frequency of access
 pub struct LFUCache<K> {
-    cache: HashSet<Item<K>>,
+    cache: HashMap<Arc<K>, Item<K>>,
     first: Option<Arc<K>>,
     last: Option<Arc<K>>,
 }
@@ -87,15 +59,15 @@ impl<K: Eq + Hash> LFUCache<K> {
     /// Construct a new `LFUCache`.
     pub fn new() -> Self {
         Self {
-            cache: HashSet::new(),
+            cache: HashMap::new(),
             first: None,
             last: None,
         }
     }
 
     /// Return `true` if the cache contains the given key.
-    pub fn contains(&self, key: &K) -> bool {
-        self.cache.contains(key)
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.cache.contains_key(key)
     }
 
     /// Increase the given `key`'s priority and return `true` if present, otherwise `false`.
@@ -192,7 +164,7 @@ impl<K: Eq + Hash> LFUCache<K> {
                 state: Arc::new(RwLock::new(ItemState { prev, next })),
             };
 
-            assert!(self.cache.insert(item));
+            assert!(self.cache.insert(key, item).is_none());
 
             false
         }
@@ -264,7 +236,7 @@ impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
     /// Remove and return the last element in the cache, if any.
     pub fn pop(&mut self) -> Option<K> {
         let last = self.last.as_ref()?;
-        let item = self.cache.take::<K>(last).expect("last entry");
+        let item = self.cache.remove(last).expect("last entry");
         let key = self.remove_inner(item);
         let key = Arc::try_unwrap(key).expect("key");
         Some(key)
@@ -272,7 +244,7 @@ impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
 
     /// Remove the given `key` from the cache and return it, if it was present.
     pub fn remove(&mut self, key: &K) -> Option<K> {
-        let item = self.cache.take(key)?;
+        let item = self.cache.remove(key)?;
         let key = self.remove_inner(item);
         let key = Arc::try_unwrap(key).expect("key");
         Some(key)
@@ -280,12 +252,12 @@ impl<K: Eq + Hash + fmt::Debug> LFUCache<K> {
 }
 
 pub struct Iter<'a, K> {
-    cache: &'a HashSet<Item<K>>,
+    cache: &'a HashMap<Arc<K>, Item<K>>,
     current: Option<Arc<K>>,
 }
 
 impl<'a, K: Eq + Hash> Iter<'a, K> {
-    fn new(cache: &'a HashSet<Item<K>>, current: Option<Arc<K>>) -> Self {
+    fn new(cache: &'a HashMap<Arc<K>, Item<K>>, current: Option<Arc<K>>) -> Self {
         Self { cache, current }
     }
 }
