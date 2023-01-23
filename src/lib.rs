@@ -248,6 +248,7 @@ impl<K: Eq + Hash, V> LFUCache<K, V> {
     }
 }
 
+/// An [`Iterator`] over an [`LFUCache`]
 pub struct Iter<'a, K, V> {
     cache: &'a HashMap<Arc<K>, Item<K, V>>,
     next: Option<(&'a Arc<K>, &'a Item<K, V>)>,
